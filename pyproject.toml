@@ -1,0 +1,19 @@
+[project]
+name = "ninferencing"
+version = "1.0.0"
+description = "Local NInfer text generation for ComfyUI. Short-lived native CLI, vision stills and video, tuned for RTX 30/40 24 GB."
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+classifiers = [
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/cicalooo/ComfyUI-Ninferencing"
+"Bug Tracker" = "https://github.com/cicalooo/ComfyUI-Ninferencing/issues"
+"NInfer Linux CLI" = "https://github.com/cicalooo/ninfer-linux"
+
+[tool.comfy]
+PublisherId = "cicalooo"
+DisplayName = "Ninferencing"
+requires-comfyui = ">=0.30.0"
