@@ -113,6 +113,13 @@ def test_empty_keep_set_returns_none(tmp_path):
     assert not (tmp_path / "never.mp4").exists()
 
 
+def test_ninfer_video_plan_scales_sample_count_with_fps():
+    frames_2, *_ = videosample.ninfer_video_plan(512, 288, 192, 24, fps=2)
+    frames_6, *_ = videosample.ninfer_video_plan(512, 288, 192, 24, fps=6)
+    assert frames_2 == 16
+    assert frames_6 == 48
+
+
 def test_samplers_share_the_nodes_entry_point():
     from Ninferencing import nodes
 

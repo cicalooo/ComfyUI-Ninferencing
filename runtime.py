@@ -24,6 +24,14 @@ VISION_TOKEN_CHARS = 3  # conservative prompt characters per token when sizing i
 # fit beside the vision engine floor (~3.33 GiB after weights). 8192 INT8 tokens leave
 # ~80 MiB spare against the measured shortfall on an idle RTX 3090.
 VIDEO_SAFE_CONTEXT = 8192
+# --vision-residency overlay borrows device memory per encode window from
+# evict-ranked weights (output head, embedding, proposal/MTP/drafter). Newer
+# builds (e.g. 8319e8f) reject startup when one window needs more than those
+# weights provide, e.g. 12288 needs ~816 MiB but only ~656 MiB is available.
+# 8192 needs ~544 MiB and fits that budget while still covering the node's
+# auto-sized stills (largest single still is ~2809 vision tokens).
+VISION_MAX_MERGED = 8192
+VISION_MAX_MERGED_LADDER = (8192, 4096, 2048, 1024)
 # Still-image multimodal (identity + sparse frames) on 24 GB / 27B: auto's 1024 MiB
 # KV headroom can fail once vision is loaded. Retry with an explicit mid context that
 # still fits a long rewrite + vision tokens — do not slam max-context to VIDEO_SAFE
@@ -35,6 +43,39 @@ CAPACITY_TIGHTEN_LADDER = (IMAGE_SAFE_CONTEXT, IMAGE_MID_CONTEXT, VIDEO_SAFE_CON
 # Step-up ladder when prepared prompt exceeds a too-tight --max-context.
 PROMPT_EXPAND_LADDER = (IMAGE_MID_CONTEXT, IMAGE_SAFE_CONTEXT, 24576, VISION_PROMPT_BUDGET)
 AUTO_KV_HEADROOM_BYTES = 1024 * 1024 * 1024
+# Current ninfer CLI sampling bounds (see --help SAMPLING). Help text overrides
+# these when a build advertises a different range. Values outside the range are
+# clamped so Custom sampling cannot fail the run (the widget used to default
+# top_k to 40, which this CLI rejects with "--top-k must be in [0,20]").
+SAMPLING_LIMITS = {
+    "temperature": (0.0, 2.0),
+    "top_p": (0.0, 1.0),
+    "top_k": (0.0, 20.0),
+    "min_p": (0.0, 1.0),
+    "presence_penalty": (-2.0, 2.0),
+    "frequency_penalty": (-2.0, 2.0),
+}
+# Qwen3.8-27B instruct / non-thinking (https://huggingface.co/Qwen/Qwen3.8-27B).
+# Official repetition_penalty is 1.0 (a no-op). This CLI has frequency_penalty, left at 0.
+QWEN38_NOTHINK_SAMPLING = {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "frequency_penalty": 0.0,
+}
+
+
+def default_sampling():
+    """Sampler used when thinking is off. Matches Qwen3.8-27B non-thinking."""
+    return {"sampling": "custom", **QWEN38_NOTHINK_SAMPLING}
+
+
+_SAMPLING_RANGE = re.compile(
+    r"(?m)^[ \t]*--(temperature|top-p|top-k|min-p|presence-penalty|frequency-penalty)"
+    r"\b[^\n]*?(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?)"
+)
 
 
 def vision_side_limit(frame_count, requested, context_length=VISION_PROMPT_BUDGET, text_tokens=0):
@@ -67,7 +108,7 @@ class Settings:
     cuda_graphs: str = "auto"
     thinking: str = "auto"
     speculation: dict = field(default_factory=lambda: {"speculation": "off"})
-    sampling: dict = field(default_factory=lambda: {"sampling": "model defaults"})
+    sampling: dict = field(default_factory=default_sampling)
     image_max_side: int = 0
     timeout: float = 600
     extra_args: str = "[]"
@@ -148,6 +189,119 @@ def _next_higher_context(current_tokens):
     for step in PROMPT_EXPAND_LADDER:
         if step > current_tokens:
             return step
+    return None
+
+
+def is_vision_residency_failure(text: str | None) -> bool:
+    """True when --vision-residency overlay cannot borrow one encode window.
+
+    Newer builds fail startup with e.g. "--vision-residency overlay needs
+    816 MiB of evict-ranked weights for one encode window, but ... provide
+    656 MiB; lower --vision-max-merged, use --vision-residency resident, or
+    drop a flag that shrinks those weights". Both the image and video nodes
+    share build_command, so both need the same retry.
+
+    Flag names alone are not enough: any usage error prints --help, and that
+    text mentions both --vision-residency and --vision-max-merged. Matching
+    those names misread "--top-k must be in [0,20]" as an overlay shortfall
+    and burned the vision retry ladder.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    if "evict-ranked" in lowered:
+        return True
+    return "encode window" in lowered and (
+        "vision-residency" in lowered or "vision-max-merged" in lowered
+    )
+
+
+def sampling_limits(help_text: str | None) -> dict[str, tuple[float, float]]:
+    """Ranges for custom sampling flags. Help text wins; otherwise SAMPLING_LIMITS."""
+    limits = dict(SAMPLING_LIMITS)
+    if not help_text:
+        return limits
+    for match in _SAMPLING_RANGE.finditer(help_text):
+        key = match.group(1).replace("-", "_")
+        limits[key] = (float(match.group(2)), float(match.group(3)))
+    return limits
+
+
+def clamp_sampling_value(key: str, value, limits: dict[str, tuple[float, float]]):
+    """Return value clamped to the build's range. In-range values are unchanged."""
+    bound = limits.get(key)
+    if bound is None or value is None:
+        return value
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return value
+    lo, hi = bound
+    if lo <= number <= hi:
+        return value
+    clamped = min(max(number, lo), hi)
+    if key == "top_k" or (isinstance(value, int) and not isinstance(value, bool)):
+        clamped = int(round(clamped))
+    LOGGER.warning(
+        "Ninferencing: sampling --%s %s is outside %s..%s; using %s",
+        key.replace("_", "-"),
+        value,
+        int(lo) if float(lo).is_integer() else lo,
+        int(hi) if float(hi).is_integer() else hi,
+        clamped,
+    )
+    return clamped
+
+
+def _next_lower_merged(current_tokens):
+    """Largest vision ladder step strictly below current.
+
+    Stops at 1024 — below that the caller falls back to resident rather than
+    crippling merged tokens further (a single auto-sized still is ~2809).
+    """
+    for step in VISION_MAX_MERGED_LADDER:
+        if step < current_tokens:
+            return step
+    return None
+
+
+def tighten_command_for_vision(command, diagnostics=None):
+    """Build a retry argv when overlay cannot borrow one encode window.
+
+    First lowers --vision-max-merged down the ladder (8192→4096→2048→1024),
+    then falls back to --vision-residency resident. Returns None when no
+    safer command can be derived.
+    """
+    if "--vision" not in command:
+        return None
+    new_cmd = list(command)
+    if "--vision-max-merged" in new_cmd:
+        idx = new_cmd.index("--vision-max-merged")
+        try:
+            current = int(new_cmd[idx + 1])
+        except (ValueError, IndexError):
+            return None
+        lowered = _next_lower_merged(current)
+        if lowered is not None:
+            new_cmd[idx + 1] = str(lowered)
+            LOGGER.warning(
+                "Ninferencing: vision overlay shortfall; retrying with --vision-max-merged %s (was %s)",
+                lowered,
+                current,
+            )
+            return new_cmd
+    if "--vision-residency" in new_cmd:
+        idx = new_cmd.index("--vision-residency")
+        try:
+            current_residency = new_cmd[idx + 1]
+        except IndexError:
+            return None
+        if current_residency.strip().lower() == "overlay":
+            new_cmd[idx + 1] = "resident"
+            LOGGER.warning(
+                "Ninferencing: vision overlay shortfall; retrying with --vision-residency resident",
+            )
+            return new_cmd
     return None
 
 
@@ -239,7 +393,7 @@ def expand_command_for_prompt_capacity(command, diagnostics=None):
     return new_cmd
 
 
-def build_command(executable, artifact, messages, settings, flags, help_text, *, max_tokens, seed, device, has_images, has_video=False):
+def build_command(executable, artifact, messages, settings, flags, help_text, *, max_tokens, seed, device, has_images, has_video=False, video_fps=2):
     extra = json.loads(settings.extra_args or "[]")
     if not isinstance(extra, list) or not all(isinstance(arg, str) for arg in extra):
         raise ValueError('Ninferencing: extra_args must be a JSON array of strings, e.g. ["--prefill-chunk", "256"].')
@@ -290,15 +444,32 @@ def build_command(executable, artifact, messages, settings, flags, help_text, *,
         if spec["lm_head_draft"]:
             add("--lm-head-draft")
     if settings.sampling.get("sampling") == "custom":
+        limits = sampling_limits(help_text)
         for key, value in settings.sampling.items():
-            if key != "sampling" and value is not None:
-                add("--" + key.replace("_", "-"), value)
+            if key == "sampling" or value is None:
+                continue
+            flag = "--" + key.replace("_", "-")
+            if flag not in flags:
+                LOGGER.warning("Ninferencing: this build does not advertise %s; leaving that sampler control at the artifact default.", flag)
+                continue
+            add(flag, clamp_sampling_value(key, value, limits))
     if has_images or has_video:
         add("--vision")
         if "--vision-residency" in flags:
             add("--vision-residency", "overlay")
         if "--vision-max-merged" in flags:
-            add("--vision-max-merged", 12288)
+            add("--vision-max-merged", VISION_MAX_MERGED)
+        try:
+            fps = int(video_fps)
+        except (TypeError, ValueError):
+            fps = 2
+        if has_video and fps != 2:
+            if "--video-fps" not in flags:
+                raise ValueError(
+                    "Ninferencing: video_fps is not 2, but this ninfer build does not advertise "
+                    "--video-fps. Install the cicalooo/ninfer-linux build with that flag, or leave video_fps at 2."
+                )
+            add("--video-fps", fps)
     command.extend(extra)
     return command
 
@@ -309,17 +480,25 @@ def generate(command, timeout, check_cancel, temp_dir, *, on_capacity=None, vram
     Still-image multimodal may need a mid-context tighten (16K/12K) before the 8K
     video floor. If a tighten leaves max-context below the prepared prompt, retry
     once more by expanding context/KV upward instead of stripping vision.
+    Vision overlay shortfall (--vision-residency overlay needs N MiB of
+    evict-ranked weights) retries with a smaller --vision-max-merged, then
+    resident. Image and video nodes share build_command, so both paths retry.
     """
     last_report = vram_report
     active = list(command)
+    has_vision = "--vision" in active
+    # Vision requests may need overlay retries plus KV tighten/expand steps.
+    # Text requests keep the original budgets so persistent-failure call counts
+    # are unchanged. Vision ladder from 8192 is 4096→2048→1024→resident (4
+    # retries); from a stale 12288 it needs one more, so allow 6 attempts.
     # With tighten: original + mid-step + second tighten or prompt-expand.
     # Reclaim-only (no tighten): original + one same-command retry.
     if tighten_on_capacity:
-        attempts = 3
+        attempts = 6 if has_vision else 3
     elif on_capacity is not None:
-        attempts = 2
+        attempts = 4 if has_vision else 2
     else:
-        attempts = 1
+        attempts = 3 if has_vision else 1
     diagnostics = ""
     for attempt in range(attempts):
         code, text, diagnostics = run_process(
@@ -333,6 +512,12 @@ def generate(command, timeout, check_cancel, temp_dir, *, on_capacity=None, vram
                 )
             return text
         if attempt + 1 < attempts:
+            if is_vision_residency_failure(diagnostics):
+                shrunk = tighten_command_for_vision(active, diagnostics)
+                if shrunk is not None and shrunk != active:
+                    active = shrunk
+                    has_vision = "--vision" in active
+                    continue
             if is_capacity_failure(diagnostics):
                 tightened = tighten_command_for_capacity(active, diagnostics) if tighten_on_capacity else None
                 if tightened is not None and tightened != active:
@@ -359,6 +544,15 @@ def generate(command, timeout, check_cancel, temp_dir, *, on_capacity=None, vram
                 "stills on 24 GB) and set Settings kv_capacity=match_context (or 16384). "
                 "Do not rely on auto→8K tighten for identity+frame grids.\n" + diagnostics
             )
+        if is_vision_residency_failure(diagnostics):
+            raise RuntimeError(
+                "Ninferencing: --vision-residency overlay needs more evict-ranked weights "
+                "than this artifact loads for one encode window. The node already retries "
+                "with a smaller --vision-max-merged, then resident. If it still fails, pass "
+                'Settings extra_args ["--vision-residency", "resident"] or '
+                '["--vision-max-merged", "4096"] (or lower), or drop a flag that shrinks '
+                "those weights (--embedding-q4/q6, --lm-head-q4/q6).\n" + diagnostics
+            )
         if re.search(
             r"(media item count|vision raw patches|vision tokens|vision attention pairs|prompt tokens)"
             r" exceeds? processor budget",
@@ -367,8 +561,8 @@ def generate(command, timeout, check_cancel, temp_dir, *, on_capacity=None, vram
             raise RuntimeError(
                 f"Ninferencing: ninfer's media preprocessor budget is exhausted. This build takes at most "
                 f"{VISION_ITEM_LIMIT} images or frames per request (native video_url counts separately as video media), "
-                "and image size is capped automatically to fit. Send fewer images/frames, or prefer Ninferencing Video "
-                "with a single native video instead of a large frame grid."
+                "and image size is capped automatically to fit. Send fewer images/frames, or connect VIDEO "
+                "on Ninferencing instead of a large frame grid."
             )
         unsupported = re.search(r"artifact identity '([^']+)' has no registered target for this device", diagnostics)
         if unsupported:
@@ -386,6 +580,13 @@ def generate(command, timeout, check_cancel, temp_dir, *, on_capacity=None, vram
                 "Settings at a ninfer-all build.\n" + diagnostics
             )
         raise RuntimeError(f"Ninferencing: ninfer exited with code {code}.\n{diagnostics}")
+    if is_vision_residency_failure(diagnostics):
+        raise RuntimeError(
+            "Ninferencing: --vision-residency overlay needs more evict-ranked weights "
+            "than this artifact loads for one encode window after retries. Pass Settings "
+            'extra_args ["--vision-residency", "resident"] or ["--vision-max-merged", "4096"] '
+            "(or lower), or drop --embedding-q4/q6 / --lm-head-q4/q6.\n" + diagnostics
+        )
     if is_prompt_context_failure(diagnostics):
         raise RuntimeError(
             "Ninferencing: prepared prompt exceeds Engine context capacity after retries. "

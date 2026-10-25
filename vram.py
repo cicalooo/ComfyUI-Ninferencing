@@ -110,23 +110,96 @@ def live_ninfer_pids(exclude_pids: set[int] | None = None) -> list[int]:
     return pids
 
 
+def _dead_real_model():
+    """Stand-in so a later Comfy cleanup never calls a None real_model."""
+    return None
+
+
+def _detach_finalizer(loaded, name: str) -> None:
+    finalizer = getattr(loaded, name, None)
+    if finalizer is None:
+        return
+    detach = getattr(finalizer, "detach", None)
+    if callable(detach):
+        try:
+            detach()
+        except Exception:
+            LOGGER.debug("Ninferencing: could not detach %s", name, exc_info=True)
+    try:
+        setattr(loaded, name, None)
+    except Exception:
+        LOGGER.debug("Ninferencing: could not clear %s", name, exc_info=True)
+
+
+def release_comfy_models() -> int:
+    """Unload Comfy's model registry without free_memory's index walk.
+
+    free_memory saves indexes, then a weakref finalizer can pop the list
+    (IndexError). A partial unload also sets real_model to None, and the
+    prompt worker's later cleanup calls it (TypeError) and kills the thread.
+    Clearing RAM does not repair that list, so the next run dies the same way.
+    """
+    registry = getattr(model_management, "current_loaded_models", None)
+    if not isinstance(registry, list):
+        return 0
+    released = 0
+    for _ in range(8):
+        loaded = list(registry)
+        if not loaded:
+            break
+        for entry in loaded:
+            # Detach before any patcher.detach(). That call can collect a module
+            # and run cleanup_models, which both shrinks the list and crashes if
+            # real_model was already cleared.
+            _detach_finalizer(entry, "model_finalizer")
+            _detach_finalizer(entry, "_patcher_finalizer")
+            try:
+                entry.real_model = _dead_real_model
+            except Exception:
+                LOGGER.debug("Ninferencing: could not replace real_model", exc_info=True)
+        for entry in loaded:
+            try:
+                model = entry.model
+            except Exception:
+                LOGGER.debug("Ninferencing: could not read loaded model", exc_info=True)
+                continue
+            if model is None:
+                continue
+            detach = getattr(model, "detach", None)
+            if not callable(detach):
+                continue
+            try:
+                detach(True)
+            except Exception:
+                LOGGER.warning(
+                    "Ninferencing: failed to detach %s",
+                    type(model).__name__,
+                    exc_info=True,
+                )
+        gone = {id(entry) for entry in loaded}
+        registry[:] = [entry for entry in registry if id(entry) not in gone]
+        released += len(loaded)
+    if registry:
+        LOGGER.warning(
+            "Ninferencing: %s Comfy model(s) still registered after unload",
+            len(registry),
+        )
+    return released
+
+
 def unload_comfy(device: int | None = None) -> None:
+    """Drop Comfy-tracked weights before ninfer.
+
+    device is unused: the registry covers every card. Do not call
+    unload_all_models or free_memory; both index current_loaded_models and
+    crash once a long session has left dead entries in it.
+    """
+    del device
     model_management.throw_exception_if_processing_interrupted()
     model_management.synchronize()
-    # unload_all_models walks every torch device; free_memory again covers the ninfer index
-    model_management.unload_all_models()
-    try:
-        import torch
-        if torch.cuda.is_available() and device is not None:
-            model_management.free_memory(1e30, torch.device("cuda", int(device)))
-    except Exception:
-        pass
-    cleanup = getattr(model_management, "cleanup_models", None)
-    if callable(cleanup):
-        cleanup()
-    cleanup_gc = getattr(model_management, "cleanup_models_gc", None)
-    if callable(cleanup_gc):
-        cleanup_gc()
+    released = release_comfy_models()
+    if released:
+        LOGGER.info("Ninferencing: released %s Comfy model(s)", released)
     for _ in range(2):
         gc.collect()
         model_management.soft_empty_cache(force=True)

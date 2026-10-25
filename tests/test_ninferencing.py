@@ -30,15 +30,16 @@ FLAGS = set(re.findall(r"--[\w-]+", HELP))
 HELP_ALL = HELP + """
 --kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8
 --spec mtp|dflash|dflash2 --gdn-state-fp16
---vision-residency resident|overlay|cpu --vision-max-merged N
+--vision-residency resident|overlay|cpu --vision-max-merged N --video-fps N
 """
 FLAGS_ALL = set(re.findall(r"--[\w-]+", HELP_ALL))
 
 
-def command(settings=runtime.Settings(), flags=FLAGS, help_text=HELP, images=False, video=False):
+def command(settings=runtime.Settings(), flags=FLAGS, help_text=HELP, images=False, video=False, video_fps=2):
     return runtime.build_command(
         Path("/runtime/ninfer"), Path("/models/any-family.ninfer"), Path("/temp/messages.json"),
         settings, flags, help_text, max_tokens=512, seed=123, device=0, has_images=images, has_video=video,
+        video_fps=video_fps,
     )
 
 
@@ -50,7 +51,13 @@ def test_default_command_is_model_neutral_and_explicit_about_memory():
     assert argv[argv.index("--kv-dtype") + 1] == "int8"
     assert "--no-cuda-graph" in argv and "--no-thinking" in argv
     assert "--spec" not in argv and "--model-id" not in argv
-    assert "--temperature" not in argv and "--vision" not in argv
+    assert "--vision" not in argv
+    assert argv[argv.index("--temperature") + 1] == "0.7"
+    assert argv[argv.index("--top-p") + 1] == "0.8"
+    assert argv[argv.index("--top-k") + 1] == "20"
+    assert argv[argv.index("--min-p") + 1] == "0.0"
+    assert argv[argv.index("--presence-penalty") + 1] == "1.5"
+    assert argv[argv.index("--frequency-penalty") + 1] == "0.0"
 
 
 def test_still_image_vision_keeps_auto_kv_capacity():
@@ -78,12 +85,15 @@ def test_kv_capacity_setting_overrides_video_default():
     assert argv[argv.index("--kv-capacity") + 1] == "12288"
 
 
-def test_video_node_default_context_is_vram_safe():
-    schema = nodes.NinferencingVideo.define_schema()
+def test_video_is_optional_and_context_stays_put():
+    schema = nodes.Ninferencing.define_schema()
     inputs = {item.id: item for item in schema.inputs}
-    assert inputs["context_length"].default == runtime.VIDEO_SAFE_CONTEXT
+    assert inputs["video"].optional
+    assert inputs["context_length"].default == 32768
+    assert inputs["video_max_side"].optional and inputs["video_max_side"].advanced
+    assert "seconds" not in inputs
+    assert [item.display_name for item in schema.outputs] == ["text"]
     settings_inputs = {item.id: item for item in nodes.NinferencingSettings.define_schema().inputs}
-    assert "kv_capacity" in settings_inputs
     assert settings_inputs["kv_capacity"].default == "auto"
 
 
@@ -110,6 +120,77 @@ def test_explicit_settings_and_build_specific_arguments():
     assert argv[argv.index("--prefill-chunk") + 1] == "128"
     assert argv[-1] == "a path with spaces"
     assert "--lm-head-draft" in argv and "--vision" in argv
+    assert argv[argv.index("--temperature") + 1] == "0.3"
+    assert argv[argv.index("--presence-penalty") + 1] == "0.8"
+
+
+def test_custom_sampling_clamps_values_the_cli_rejects():
+    settings = replace(
+        runtime.Settings(),
+        sampling={
+            "sampling": "custom",
+            "temperature": 5.0,
+            "top_p": 1.5,
+            "top_k": 40,
+            "min_p": -0.2,
+            "presence_penalty": 9.0,
+            "frequency_penalty": -9.0,
+        },
+    )
+    argv = command(settings)
+    assert argv[argv.index("--temperature") + 1] == "2.0"
+    assert argv[argv.index("--top-p") + 1] == "1.0"
+    assert argv[argv.index("--top-k") + 1] == "20"
+    assert argv[argv.index("--min-p") + 1] == "0.0"
+    assert argv[argv.index("--presence-penalty") + 1] == "2.0"
+    assert argv[argv.index("--frequency-penalty") + 1] == "-2.0"
+
+
+def test_custom_sampling_honors_a_wider_range_from_help():
+    help_text = HELP + "\n--top-k N 0..40\n--temperature F 0..2\n"
+    flags = set(re.findall(r"--[\w-]+", help_text))
+    settings = replace(
+        runtime.Settings(),
+        sampling={"sampling": "custom", "top_k": 40, "temperature": 5.0},
+    )
+    argv = command(settings, flags=flags, help_text=help_text)
+    assert argv[argv.index("--top-k") + 1] == "40"
+    assert argv[argv.index("--temperature") + 1] == "2.0"
+
+
+def test_custom_sampling_widgets_match_cli_ranges():
+    sampling = next(item for item in nodes.NinferencingSettings.define_schema().inputs if item.id == "sampling")
+    custom = next(option for option in sampling.options if option.key == "custom")
+    widgets = {item.id: item for item in custom.inputs}
+    assert (widgets["temperature"].min, widgets["temperature"].max) == (0, 2)
+    assert (widgets["top_p"].min, widgets["top_p"].max) == (0, 1)
+    assert widgets["temperature"].default == 0.7
+    assert widgets["top_p"].default == 0.8
+    assert widgets["top_k"].default == 20
+    assert widgets["min_p"].default == 0.0
+    assert widgets["presence_penalty"].default == 1.5
+    assert widgets["frequency_penalty"].default == 0.0
+    assert sampling.options[0].key == "custom"
+    assert (widgets["top_k"].min, widgets["top_k"].max) == (0, 20)
+    assert (widgets["min_p"].min, widgets["min_p"].max) == (0, 1)
+    assert (widgets["presence_penalty"].min, widgets["presence_penalty"].max) == (-2, 2)
+    assert (widgets["frequency_penalty"].min, widgets["frequency_penalty"].max) == (-2, 2)
+
+
+def test_usage_dump_is_not_a_vision_residency_failure():
+    usage = (
+        "error: --top-k must be in [0,20]\n"
+        "usage: ninfer\n"
+        "  --vision-residency resident|overlay|cpu\n"
+        "  --vision-max-merged N\n"
+    )
+    assert runtime.is_vision_residency_failure(usage) is False
+    assert runtime.is_vision_residency_failure(
+        "--vision-residency overlay needs 816 MiB of evict-ranked weights for one encode window"
+    )
+    assert runtime.is_vision_residency_failure(
+        "lower --vision-max-merged; one encode window still does not fit"
+    )
 
 
 @pytest.mark.parametrize("args", ['["--messages=x"]', '["--raw-output"]', '["--"]', '["some-other-model.ninfer"]', '{"x": 1}'])
@@ -218,7 +299,9 @@ def test_memory_handoff_unloads_and_waits(monkeypatch):
     monkeypatch.setattr(vram, "free_bytes", lambda device=0: 8 * 1024 ** 3)
     monkeypatch.setattr(vram.model_management, "throw_exception_if_processing_interrupted", lambda: calls.append("check"))
     monkeypatch.setattr(vram.model_management, "synchronize", lambda: calls.append("sync"))
+    monkeypatch.setattr(vram.model_management, "current_loaded_models", [])
     monkeypatch.setattr(vram.model_management, "unload_all_models", lambda: calls.append("unload"))
+    monkeypatch.setattr(vram.model_management, "free_memory", lambda *_args, **_kwargs: calls.append("free"))
     monkeypatch.setattr(vram.model_management, "cleanup_models", lambda: calls.append("cleanup"))
     monkeypatch.setattr(vram.model_management, "cleanup_models_gc", lambda: calls.append("cleanup_gc"))
     monkeypatch.setattr(vram.gc, "collect", lambda: calls.append("gc"))
@@ -228,7 +311,72 @@ def test_memory_handoff_unloads_and_waits(monkeypatch):
     assert report["killed_orphans"] == [42]
     assert report["after_free"] == 8 * 1024 ** 3
     assert calls[0] == "reap"
-    assert "unload" in calls and "cleanup" in calls and ("empty", True) in calls
+    assert ("empty", True) in calls
+    assert "unload" not in calls and "free" not in calls
+    assert "cleanup" not in calls and "cleanup_gc" not in calls
+
+
+def test_unload_comfy_survives_shrinking_registry(monkeypatch):
+    import Ninferencing.vram as vram
+
+    registry = []
+
+    class Finalizer:
+        def __init__(self):
+            self.detached = False
+
+        def detach(self):
+            self.detached = True
+
+    class Patcher:
+        def __init__(self):
+            self.detached = False
+
+        def detach(self, unpatch_all=True):
+            assert unpatch_all is True
+            # cleanup_models runs on GC during detach and calls real_model().
+            for entry in list(registry):
+                entry.real_model()
+            # The Comfy bug: that finalizer also pops the list while free_memory holds indexes.
+            if registry:
+                registry.pop(0)
+            self.detached = True
+
+    live = type("Loaded", (), {})()
+    live.model = Patcher()
+    live.real_model = lambda: object()
+    live_finalizer = Finalizer()
+    live_patcher_finalizer = Finalizer()
+    live.model_finalizer = live_finalizer
+    live._patcher_finalizer = live_patcher_finalizer
+
+    dead = type("Loaded", (), {})()
+    dead.model = None
+    dead.real_model = None
+    dead.model_finalizer = None
+    dead._patcher_finalizer = None
+
+    registry.extend([live, dead])
+    forbidden = []
+    monkeypatch.setattr(vram.model_management, "current_loaded_models", registry)
+    monkeypatch.setattr(vram.model_management, "unload_all_models", lambda: forbidden.append("unload"))
+    monkeypatch.setattr(vram.model_management, "free_memory", lambda *_args, **_kwargs: forbidden.append("free"))
+    monkeypatch.setattr(vram.model_management, "cleanup_models", lambda: forbidden.append("cleanup"))
+    monkeypatch.setattr(vram.model_management, "cleanup_models_gc", lambda: forbidden.append("cleanup_gc"))
+    monkeypatch.setattr(vram.model_management, "throw_exception_if_processing_interrupted", lambda: None)
+    monkeypatch.setattr(vram.model_management, "synchronize", lambda: None)
+    monkeypatch.setattr(vram.model_management, "soft_empty_cache", lambda force=False: None)
+    monkeypatch.setattr(vram.gc, "collect", lambda: None)
+
+    vram.unload_comfy(0)
+
+    assert live.model.detached
+    assert live_finalizer.detached and live.model_finalizer is None
+    assert live_patcher_finalizer.detached and live._patcher_finalizer is None
+    assert live.real_model() is None
+    assert dead.real_model() is None
+    assert registry == []
+    assert forbidden == []
 
 
 
@@ -431,6 +579,61 @@ def test_image_list_socket_accepts_video_batch_and_output_is_list(tmp_path):
     assert schema_inputs["image_list"].optional
 
 
+def test_refs_cable_is_picture_order_and_separate_images(tmp_path):
+    red = torch.zeros(1, 8, 6, 3)
+    red[..., 0] = 1
+    green = torch.zeros(1, 5, 9, 3)
+    green[..., 1] = 1
+    # is_input_list wraps the bin tuple. Extra sockets must follow, not replace, bin order.
+    sources = nodes.collect_image_sources(
+        images={"image0": torch.full((1, 2, 2, 3), 0.25)},
+        image_list=torch.zeros(1, 3, 3, 3),
+        refs=[(red, green)],
+    )
+    assert list(sources) == ["refs", "image0", "image_list"]
+    path, has_images = nodes.write_messages(tmp_path, "look", "", sources, 0, 32768)
+    content = json.loads(path.read_text(encoding="utf-8"))[0]["content"]
+    assert has_images and content[-1]["text"] == "look"
+    sizes = []
+    colors = []
+    for item in content[:-1]:
+        assert item["type"] == "image_url"
+        with Image.open(item["image_url"]["url"]) as image:
+            assert image.format == "PNG" and image.mode == "RGB"
+            sizes.append(image.size)
+            colors.append(image.getpixel((0, 0)))
+    assert sizes == [(6, 8), (9, 5), (2, 2), (3, 3)]
+    assert colors[0][0] > 200 and colors[1][1] > 200
+    assert colors[2][0] > 40 and colors[3] == (0, 0, 0)
+
+
+def test_refs_follow_video_and_are_not_thinned(tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake")
+    refs = tuple(torch.full((1, 4, 4, 3), index / 16) for index in range(1, 10))
+    sources = nodes.collect_image_sources(
+        images={"image0": torch.zeros(20, 4, 4, 3)},
+        refs=refs,
+    )
+    path, _ = nodes.write_messages(tmp_path, "x", "", sources, 0, 32768, video_paths=[video])
+    content = json.loads(path.read_text(encoding="utf-8"))[0]["content"]
+    assert content[0]["type"] == "video_url"
+    images = content[1:-1]
+    assert len(images) == 15  # 9 pinned refs + 6 spread extras; video takes the 16th slot
+    with Image.open(images[0]["image_url"]["url"]) as first_image:
+        first_pixel = first_image.getpixel((0, 0))[0]
+    with Image.open(images[8]["image_url"]["url"]) as last_ref:
+        last_pixel = last_ref.getpixel((0, 0))[0]
+    assert first_pixel > 10 and last_pixel > first_pixel
+
+
+def test_refs_over_vision_budget_are_not_thinned(tmp_path):
+    refs = tuple(torch.zeros(1, 4, 4, 3) for _ in range(17))
+    sources = nodes.collect_image_sources(refs=refs)
+    with pytest.raises(ValueError, match="not thinned"):
+        nodes.write_messages(tmp_path, "", "", sources, 0, 32768)
+
+
 def test_image_resize_is_only_opt_in(tmp_path):
     path, _ = nodes.write_messages(tmp_path, "", "", {"image0": torch.zeros(1, 300, 200, 1)}, 150, 32768)
     source = json.loads(path.read_text())[0]["content"][0]["image_url"]["url"]
@@ -439,17 +642,18 @@ def test_image_resize_is_only_opt_in(tmp_path):
 
 
 def test_schemas_are_valid_and_have_no_required_image():
-    for node in (nodes.Ninferencing, nodes.NinferencingVideo, nodes.NinferencingSettings):
+    for node in (nodes.Ninferencing, nodes.NinferencingSettings):
         schema = node.define_schema()
         schema.finalize()
         schema.validate()
     main_inputs = {item.id: item for item in nodes.Ninferencing.define_schema().inputs}
-    video_inputs = {item.id: item for item in nodes.NinferencingVideo.define_schema().inputs}
     settings_inputs = {item.id: item for item in nodes.NinferencingSettings.define_schema().inputs}
     images = main_inputs["images"]
     assert images.optional and images.template.min == 0
+    refs = main_inputs["refs"]
+    assert refs.optional and refs.get_io_type() == "CF_REFS"
+    assert main_inputs["image_list"].optional and main_inputs["image_list"].advanced
     assert main_inputs["context_length"].default == 32768
-    assert video_inputs["context_length"].default == runtime.VIDEO_SAFE_CONTEXT
     assert "seed" not in main_inputs and settings_inputs["seed"].default == 0
     assert settings_inputs["seed"].control_after_generate == nodes.io.ControlAfterGenerate.fixed
     assert settings_inputs["kv_capacity"].default == "auto"
@@ -530,12 +734,21 @@ def test_capacity_failure_without_tighten_keeps_same_command(monkeypatch):
     assert len(calls) == 2 and calls[0] == calls[1] == argv
 
 
+def test_video_fps_omitted_at_default_and_passed_when_raised():
+    defaulted = command(flags=FLAGS_ALL, help_text=HELP_ALL, video=True)
+    assert "--video-fps" not in defaulted
+    raised = command(flags=FLAGS_ALL, help_text=HELP_ALL, video=True, video_fps=6)
+    assert raised[raised.index("--video-fps") + 1] == "6"
+    with pytest.raises(ValueError, match="does not advertise --video-fps"):
+        command(flags=FLAGS, help_text=HELP, video=True, video_fps=6)
+
+
 def test_ninfer_all_adds_gdn_and_vision_overlay():
     argv = command(flags=FLAGS_ALL, help_text=HELP_ALL, images=True)
     assert "--gdn-state-fp16" in argv
     assert "--vision" in argv
     assert argv[argv.index("--vision-residency") + 1] == "overlay"
-    assert argv[argv.index("--vision-max-merged") + 1] == "12288"
+    assert argv[argv.index("--vision-max-merged") + 1] == str(runtime.VISION_MAX_MERGED)
     text = command(flags=FLAGS_ALL, help_text=HELP_ALL)
     assert "--gdn-state-fp16" in text
     assert "--vision" not in text and "--vision-residency" not in text
@@ -575,6 +788,44 @@ def test_v1_v2_magic_failure_names_ninfer_all(monkeypatch):
         runtime.generate(command(), 5, lambda: None, None)
     assert "ninfer-linux" in str(error.value)
     assert "usage:" in str(error.value)
+
+
+def test_sampling_usage_error_is_not_retried_as_vision(monkeypatch):
+    calls = []
+
+    def fail(command, **kwargs):
+        calls.append(list(command))
+        return 1, "", (
+            "error: --top-k must be in [0,20]\n"
+            "usage: ninfer\n"
+            "  --vision-residency resident|overlay|cpu\n"
+            "  --vision-max-merged N\n"
+        )
+
+    monkeypatch.setattr(runtime, "run_process", fail)
+    argv = command(flags=FLAGS_ALL, help_text=HELP_ALL, images=True)
+    with pytest.raises(RuntimeError, match="top-k must be in") as error:
+        runtime.generate(argv, 5, lambda: None, None)
+    assert "evict-ranked weights" not in str(error.value)
+    assert len(calls) == 1
+
+
+def test_vision_overlay_shortfall_still_retries(monkeypatch):
+    calls = []
+
+    def fail(command, **kwargs):
+        calls.append(list(command))
+        return 1, "", (
+            "--vision-residency overlay needs 816 MiB of evict-ranked weights "
+            "for one encode window, but provide 656 MiB; lower --vision-max-merged"
+        )
+
+    monkeypatch.setattr(runtime, "run_process", fail)
+    argv = command(flags=FLAGS_ALL, help_text=HELP_ALL, images=True)
+    with pytest.raises(RuntimeError, match="evict-ranked"):
+        runtime.generate(argv, 5, lambda: None, None)
+    assert calls[0][calls[0].index("--vision-max-merged") + 1] == "8192"
+    assert calls[1][calls[1].index("--vision-max-merged") + 1] == "4096"
 
 
 def test_non_capacity_failure_is_not_retried(monkeypatch):

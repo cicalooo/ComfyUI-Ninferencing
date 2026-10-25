@@ -15,18 +15,6 @@ from Ninferencing.replace_nodes import (
 from Ninferencing.runtime import IMAGE_MID_CONTEXT, VIDEO_SAFE_CONTEXT
 
 
-def test_clip_seconds_prefers_int_then_duration_then_video():
-    from Ninferencing.nodes import resolve_clip_seconds
-
-    class Clip:
-        def get_duration(self):
-            return 14.6
-
-    assert resolve_clip_seconds(Clip(), seconds=9, duration_seconds=15) == 9
-    assert resolve_clip_seconds(Clip(), seconds=0, duration_seconds=15.2) == 15
-    assert resolve_clip_seconds(Clip(), seconds=0, duration_seconds=0, start_seconds=2) == 13
-
-
 def test_analysis_schemas_keep_the_two_views_separate():
     image = NinferencingImageAnalysis.define_schema()
     video = NinferencingVideoAnalysis.define_schema()
@@ -48,7 +36,6 @@ def test_no_node_is_an_output_node_or_carries_a_preview():
     """Text leaves through sockets only, and nothing runs without a consumer."""
     for node in (
         nodes.Ninferencing,
-        nodes.NinferencingVideo,
         nodes.NinferencingSettings,
         NinferencingImageAnalysis,
         NinferencingVideoAnalysis,

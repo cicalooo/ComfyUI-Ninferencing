@@ -1,6 +1,6 @@
 # Ninferencing
 
-Local NInfer text generation for ComfyUI, built around a short-lived native CLI process. Five nodes: **Ninferencing** (image-default rewrite), **Ninferencing Video** (native `video_url` rewrite), optional **Ninferencing Settings**, and two analysis views for a MiniMax H3 swap — **Ninferencing Image Analysis** and **Ninferencing Video Analysis**.
+Local NInfer text generation for ComfyUI, built around a short-lived native CLI process. Four nodes: **Ninferencing** (text, stills, or an optional native video), optional **Ninferencing Settings**, and two analysis views — **Ninferencing Image Analysis** and **Ninferencing Video Analysis**.
 
 Text leaves through the node's output socket. There is no on-node preview widget.
 
@@ -82,10 +82,12 @@ Use **file path** to select any other existing `.ninfer` artifact.
 - **prompt**: the request sent to the model.
 - **system_prompt**: instructions, under advanced inputs. The default improves image prompts; edit or clear it for chat and other tasks.
 - **max_tokens**: output budget, default 4096, including thinking when enabled.
-- **context_length**: prompt, image, and output capacity, default 32,768 tokens.
-- **image_max_side**: down-only longest-edge cap for every still, list item, batch item, or video frame. `0` picks the largest side the frame count allows.
-- **image_list**: optional single socket for an IMAGE batch or ComfyUI image list (`OUTPUT_IS_LIST`).
-- **images**: optional expanding sockets. All connected images and `image_list` are combined into one request.
+- **context_length**: prompt, media, and output capacity, default 32,768 tokens. Connecting video does not change this. On 24 GB, lower it to 8192–16384 when a clip is attached; `kv_capacity auto` then matches that context.
+- **video**: optional. Sent as a native `video_url` (`<Video 1>`). Leave unconnected for stills or text.
+- **start_at_timestamp** / **duration_seconds** / **video_max_side** / **video_fps**: advanced. Apply only when `video` is connected. `duration_seconds=0` sends the full input. `video_max_side=0` does not resize the clip. `video_fps` is 2, 3, 4, 5, or 6; 2 is the default and is omitted from the CLI. 5 and 6 are for short plates. Needs a ninfer that advertises `--video-fps`.
+- **image_max_side**: down-only longest-edge cap for stills and `image_list`. `0` picks the largest side the frame count allows. Native video uses `video_max_side`.
+- **refs**: optional CF Image Bin cable (`CF_REFS`). Bin order is `<Picture 1>` onward. Each still is written as its own image and is not thinned. Do not also wire the bin's `image_list`.
+- **image_list** / **images**: backup stills after `refs`. Advanced.
 
 Connecting an image enables `--vision`. The artifact must contain vision support.
 
@@ -104,17 +106,13 @@ Vision cost is the square of each image's patch grid, summed over every image an
 
 On a 24 GB card the 16-frame case still fits: vision weights add about 0.28 GiB and a 32,768-token INT8 KV cache is 1.50 GiB. BF16 KV doubles the cache and is the wrong choice on 24 GB.
 
-### Ninferencing Video
+### Optional video
 
-`LoadVideo` → **Ninferencing Video** sends the clip as a native `video_url` (`--vision`). Prefer this over a sparse frame grid.
+Wire `LoadVideo` into **Ninferencing** `video`. The clip is a native `video_url` (`<Video 1>`). CF Image Bin `refs` stay `<Picture 1>` onward. One output: `text`.
 
-- Default `system_prompt` is video-oriented. The image node keeps its own default.
-- Default `context_length` is **8192**. On a 24 GB card with a 27B artifact, native `--vision` raises the engine floor to about 3.33 GiB after weights. `--kv-capacity auto` then adds a fixed 1024 MiB headroom and does not fit. Video therefore passes an explicit `--kv-capacity` matching `context_length`.
-- Optional `start_at_timestamp` / `duration_seconds` trim before export. `duration_seconds=0` uses the full input. Over-long requests are clamped; a start past EOF raises with diagnostics.
-- Optional stills share the same request as extra `image_url` parts.
-- Outputs: `text`, and `enhanced_video` (the same string, for a downstream video-prompt field).
+On a 24 GB card with a 27B artifact, native `--vision` raises the engine floor enough that `--kv-capacity auto`'s 1024 MiB headroom does not fit. A connected clip therefore passes `--kv-capacity` equal to `context_length`. The widget itself stays at 32768. Lower it to 8192–16384 for a clip.
 
-A clip longer than the 16-item vision budget is not rejected. The export keeps at most 16 frames **spread across the whole clip** and writes them at a rate that preserves wall-clock length, so an 8 second clip stays 8 seconds. Decoding is streamed — the clip is never pulled into a tensor batch just to be thinned. `video_max_side` (default `0` on this node) caps the longest edge while decoding.
+A clip longer than the 16-item vision budget is not rejected. The export keeps at most 16 frames **spread across the whole clip** and writes them at a rate that preserves wall-clock length. Decoding is streamed. `video_max_side` caps the longest edge while decoding.
 
 ### Analysis nodes
 
@@ -124,10 +122,24 @@ A clip longer than the 16-item vision budget is not rejected. The export keeps a
 
 Neither is an output node. Wire `text` yourself. Both accept **Ninferencing Settings** and should use the same `.ninfer` file.
 
+### H3 swap
+
+Write a plain request; no command language. See `h3-swap-command-report.md`.
+
+1. **Ninferencing H3 Swap System** (`locked` or `delta`) → **Ninferencing** `system_prompt`. The dialects ship with the pack; no Load Markdown file is needed.
+2. **Ninferencing H3 Attachment Map** (still count, plate connected) + a plain text node with your request → Concatenate Text (map first, newline delimiter) → **Ninferencing** `prompt`.
+3. Stills → `refs` (CF Image Bin) or `image_list`; plate → `video`.
+4. Optional: **Image Analysis** (still) and **Video Analysis** (plate) for separate fact sheets.
+
+The instructions lock intent; they do not make H3 pixel-perfect. See `example_workflows/ninferencing_h3_swap_wiring.json`.
+
+The former **Ninferencing H3 Swap Command** node was removed; saved workflows that contain it will show it as a missing node. Replace it with a plain text node.
+
 ## Settings
 
-Image **Ninferencing** defaults to 32,768 tokens. **Ninferencing Video** defaults to 8,192. When the CLI advertises the flags, both select:
+**Ninferencing** defaults to 32,768 tokens. When the CLI advertises the flags, it selects:
 
+- Qwen3.8-27B non-thinking sampler: temperature 0.7, top_p 0.8, top_k 20, min_p 0, presence_penalty 1.5. Thinking stays off. Switch Settings sampling to **model defaults** for the artifact's thinking sampler;
 - `--kv-capacity auto` for text and stills;
 - `--kv-capacity <context_length>` for native video (`auto` on Settings is treated as match-context on the video path);
 - INT8 KV cache;
@@ -135,7 +147,7 @@ Image **Ninferencing** defaults to 32,768 tokens. **Ninferencing Video** default
 - CUDA graphs off;
 - thinking off;
 - no speculative decoding;
-- `--vision-residency overlay` and `--vision-max-merged 12288` on multimodal requests when advertised.
+- `--vision-residency overlay` and `--vision-max-merged 8192` on multimodal requests when advertised.
 
 `kv_capacity` is `auto`, `match_context`, or a fixed count (`4096` / `8192` / `12288` / `16384` / `32768`). On 24 GB, prefer `match_context` or `8192` for video, and **context_length 12288–16384** with `match_context` for image rewrites that include stills. Leaving image context at 32K with `auto` can shortfall, and slamming to 8K then fails with `prepared prompt exceeds Engine context capacity`. Prefer `int8` KV.
 

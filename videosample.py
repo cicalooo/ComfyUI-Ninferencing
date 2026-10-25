@@ -15,6 +15,7 @@ plate, so those stamps must still map 1:1 onto the original timeline.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from fractions import Fraction
 from pathlib import Path
 
@@ -135,58 +136,63 @@ def sample_video(info: VideoInfo, destination, *, keep, target_size=None) -> Pat
     keep = sorted({int(index) for index in keep if int(index) >= 0})
     if not keep:
         return None
-    images = []
-    with av.open(str(info.path)) as container:
-        stream = container.streams.video[0]
-        pointer = 0
-        last = keep[-1]
-        for index, frame in enumerate(container.decode(video=0)):
-            while pointer < len(keep) and keep[pointer] < index:
-                pointer += 1
-            if pointer >= len(keep) or index > last:
-                break
-            if index != keep[pointer]:
-                continue
-            image = Image.fromarray(frame.to_ndarray(format="rgb24"))
-            width, height = _even(image.width), _even(image.height)
-            if target_size is not None:
-                wanted = (_even(target_size[0]), _even(target_size[1]))
-                if image.size != wanted:
-                    image = image.resize(wanted, Image.Resampling.LANCZOS)
-            elif image.size != (width, height):
-                image = image.crop((0, 0, width, height))
-            images.append(image)
-            pointer += 1
-    if not images:
-        return None
-
+    # Output rate is fixed up front from the planned frame count so the clip
+    # plays as long as the source window (timestamps stay wall-clock true).
+    # Frames are encoded as they are decoded: peak memory is one frame, not
+    # the whole clip (full-clip mode keeps every frame).
     duration = Fraction(info.duration).limit_denominator(1_000_000)
-    out_rate = Fraction(len(images)) / duration
+    out_rate = Fraction(len(keep)) / duration if duration > 0 else info.rate
     if out_rate <= 0:
         out_rate = info.rate
     # Never faster than the source, and never slower than one frame per 4 s:
     # below that the encoder's own defaults start inserting duplicate frames.
     out_rate = min(out_rate, info.rate)
-    out_rate = max(out_rate, Fraction(1, 4))
+    out_rate = max(out_rate, Fraction(1, 4)).limit_denominator(1_000_000)
 
     destination = Path(destination)
-    width, height = _even(images[0].width), _even(images[0].height)
-    with av.open(str(destination), mode="w") as output:
-        out_stream = output.add_stream("libx264", rate=out_rate)
-        out_stream.width = width
-        out_stream.height = height
-        out_stream.pix_fmt = "yuv420p"
-        for image in images:
-            array = np.asarray(image)
-            if array.shape[1] != width or array.shape[0] != height:
-                array = np.asarray(
-                    Image.fromarray(array).crop((0, 0, width, height))
-                )
-            packet_source = av.VideoFrame.from_ndarray(array, format="rgb24")
-            for packet in out_stream.encode(packet_source):
-                output.mux(packet)
+    output = None
+    out_stream = None
+    width = height = 0
+    written = 0
+    try:
+        with av.open(str(info.path)) as container:
+            pointer = 0
+            last = keep[-1]
+            for index, frame in enumerate(container.decode(video=0)):
+                while pointer < len(keep) and keep[pointer] < index:
+                    pointer += 1
+                if pointer >= len(keep) or index > last:
+                    break
+                if index != keep[pointer]:
+                    continue
+                image = Image.fromarray(frame.to_ndarray(format="rgb24"))
+                if target_size is not None:
+                    wanted = (_even(target_size[0]), _even(target_size[1]))
+                    if image.size != wanted:
+                        image = image.resize(wanted, Image.Resampling.LANCZOS)
+                if output is None:
+                    width, height = _even(image.width), _even(image.height)
+                    output = av.open(str(destination), mode="w")
+                    out_stream = output.add_stream("libx264", rate=out_rate)
+                    out_stream.width = width
+                    out_stream.height = height
+                    out_stream.pix_fmt = "yuv420p"
+                if image.size != (width, height):
+                    image = image.crop((0, 0, width, height))
+                packet_source = av.VideoFrame.from_ndarray(np.asarray(image), format="rgb24")
+                for packet in out_stream.encode(packet_source):
+                    output.mux(packet)
+                written += 1
+                pointer += 1
+        if output is None:
+            return None
         for packet in out_stream.encode():
             output.mux(packet)
+    finally:
+        if output is not None:
+            output.close()
+    if written == 0:
+        return None
     return destination
 
 
@@ -196,6 +202,7 @@ def build_clip(
     *,
     max_frames: int,
     max_side: int = 0,
+    full: bool = False,
 ) -> Path | None:
     """Plan and write the clip ninfer should see, or None when it is fine as-is.
 
@@ -204,7 +211,9 @@ def build_clip(
     """
     if info is None:
         return None
-    needs_sample = info.frame_count > max_frames
+    # full=True keeps every source frame (ninfer samples the clip itself);
+    # max_frames is then ignored.
+    needs_sample = (not full) and info.frame_count > max_frames
     target_size = None
     if max_side > 0 and max(info.width, info.height) > max_side:
         target_w, target_h = lock_size(info.width, info.height, max_side, 2)
@@ -229,3 +238,65 @@ def _spread(count: int, budget: int):
     if budget == 1:
         return [count // 2]
     return [round(i * (count - 1) / (budget - 1)) for i in range(budget)]
+
+
+# ninfer qwen3_5 frontend video constants (src/models/qwen3_5/frontend/frontend.cpp:52-54,
+# processor.cpp:42-45, decode.cpp:459). The artifact must still declare fps=2.
+# --video-fps overrides the sample rate after that check; 2 is the default.
+NINFER_VIDEO_FPS = 2.0
+NINFER_VIDEO_MIN_FRAMES = 4
+NINFER_VIDEO_MAX_FRAMES = 768
+_FACTOR = 32  # patch 16 x merge 2
+_TEMPORAL = 2
+
+
+def _round_even_half(value: float) -> int:
+    return int(round(value))  # Python round is half-to-even, same as the C++ round_even helper
+
+
+def ninfer_video_plan(width, height, frame_count, rate, max_pixels=8192 * _FACTOR * _FACTOR * _TEMPORAL,
+                      min_pixels=128 * 32 * 32, fps=NINFER_VIDEO_FPS):
+    """Mirror of ninfer's native video sampling + smart_resize_video for an exported clip.
+
+    Returns (sampled_frames, grid_w, grid_h, vision_tokens, timestamps). max_pixels defaults to
+    the bound --vision-max-merged 8192 puts on one video item (8192 merged tokens).
+    """
+    rate = float(rate)
+    total = int(frame_count)
+    target = float(fps) if fps else NINFER_VIDEO_FPS
+    if total < 1 or rate <= 0 or target <= 0:
+        return 0, 0, 0, 0, []
+    count = int(total / rate * target)
+    count = min(max(count, NINFER_VIDEO_MIN_FRAMES), NINFER_VIDEO_MAX_FRAMES, total)
+    if count == 1:
+        indices = [0]
+    else:
+        indices = [int(round(i * (total - 1) / (count - 1))) for i in range(count)]
+    h = _round_even_half(height / _FACTOR) * _FACTOR
+    w = _round_even_half(width / _FACTOR) * _FACTOR
+    padded = ((count + _TEMPORAL - 1) // _TEMPORAL) * _TEMPORAL
+    volume = padded * h * w
+    if volume > max_pixels:
+        beta = (count * height * width / max_pixels) ** 0.5
+        h = max(_FACTOR, int(height / beta // _FACTOR) * _FACTOR)
+        w = max(_FACTOR, int(width / beta // _FACTOR) * _FACTOR)
+    elif volume < min_pixels:
+        beta = (min_pixels / (count * height * width)) ** 0.5
+        h = math.ceil(height * beta / _FACTOR) * _FACTOR
+        w = math.ceil(width * beta / _FACTOR) * _FACTOR
+    groups = padded // _TEMPORAL
+    tokens = groups * (h // _FACTOR) * (w // _FACTOR)
+    pad = indices + ([indices[-1]] if len(indices) % _TEMPORAL else [])
+    stamps = [(pad[2 * t] + pad[2 * t + 1]) / (2.0 * rate) for t in range(groups)]
+    return count, w, h, tokens, stamps
+
+
+def fit_side_for_tokens(width, height, frame_count, rate, max_side, token_budget, fps=NINFER_VIDEO_FPS):
+    """Largest even max_side <= max_side whose ninfer video plan stays within token_budget."""
+    side = int(max_side)
+    while side > 64:
+        tw, th = lock_size(width, height, side, 2) if max(width, height) > side else (width, height)
+        if ninfer_video_plan(tw, th, frame_count, rate, fps=fps)[3] <= token_budget:
+            return side
+        side -= 32
+    return 64

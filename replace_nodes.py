@@ -152,8 +152,8 @@ class NinferencingVideoAnalysis(io.ComfyNode):
 
     @classmethod
     def fingerprint_inputs(cls, model, settings=None, **kwargs):
-        from .nodes import NinferencingVideo
-        return NinferencingVideo.fingerprint_inputs(model, settings=settings, **kwargs)
+        from .nodes import Ninferencing
+        return Ninferencing.fingerprint_inputs(model, settings=settings, **kwargs)
 
     @classmethod
     def execute(
