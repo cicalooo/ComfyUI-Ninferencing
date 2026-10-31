@@ -7,7 +7,14 @@ from pathlib import Path
 import re
 
 from .process import run_process
-from .vram import capacity_error_message, is_capacity_failure, is_prompt_context_failure
+from .vram import (
+    capacity_error_message,
+    format_bytes,
+    is_capacity_failure,
+    is_prompt_context_failure,
+    parse_reservation_shortfall,
+    qwen_moe_memory_terms,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +85,64 @@ _SAMPLING_RANGE = re.compile(
 )
 
 
+# ninfer's stderr framing, read from upstream ninfer-all @ 7a89828
+# (apps/cli/main.cpp, src/product/logging/*.cpp, src/models/qwen3_5/frontend/output_session.cpp):
+# reasoning deltas stream raw to stderr with no tags (the </think> close marker is
+# consumed as the channel boundary and never published); engine logs share the
+# stream (level prefixes, `media | `/`engine | ` sources, unprefixed info startup
+# lines, all pre-generation except `engine | ` diagnostics); a trailing summary
+# block always ends a successful run behind the exact header below.
+_SUMMARY_HEADER = "phase       detail                      elapsed/progress"
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_LOG_LINE_RE = re.compile(
+    r"^(?:trace: |debug: |warning: |error: |fatal: |media \| |engine \| |ninfer: |ninfer logging failure: )"
+)
+_STARTUP_LINE_RE = re.compile(
+    r"^(?:"
+    r"build \S+"
+    r"|starting engine"
+    r"|(?:loading weights|pinning host state|pinning host KV|loading prefix cache)(?: \||$)"
+    r"|(?:weights ready|host state pinned|host KV pinned|CUDA graphs ready"
+    r"|prefix cache (?:read|restored|not restored|partly restored)|engine ready)(?: \||$)"
+    # Progress lines: persistent (non-TTY, every 10 s) render bar-less as
+    # `  loading weights 97.2% | ...`; interactive TTY ones carry `[==>]` bars.
+    r"|  (?:loading weights|pinning host state|pinning host KV|loading prefix cache) (?:\[|\d)"
+    r")"
+)
+
+
+def extract_reasoning(stderr_text: str | None) -> str:
+    """Reasoning stream from ninfer's stderr, without engine logs or the summary.
+
+    Drops the trailing summary block (everything from the last exact
+    ``phase ... elapsed/progress`` header line), every ``level: `` / ``media | `` /
+    ``engine | `` / ``ninfer: `` log line, and the leading block of unprefixed
+    startup lines. Everything else is model thinking text, rejoined verbatim.
+
+    Fail-open by design: a log format a future CLI adds that matches none of the
+    patterns leaks into the output rather than dropping thinking text.
+    """
+    if not stderr_text:
+        return ""
+    text = _ANSI_CSI_RE.sub("", stderr_text)
+    lines = text.split("\n")
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].strip() == _SUMMARY_HEADER:
+            del lines[index:]
+            break
+    kept = []
+    leading = True
+    for line in lines:
+        if _LOG_LINE_RE.match(line):
+            continue
+        if leading:
+            if _STARTUP_LINE_RE.match(line):
+                continue
+            leading = False
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 def vision_side_limit(frame_count, requested, context_length=VISION_PROMPT_BUDGET, text_tokens=0):
     """Longest image side that keeps a request inside the build's vision budgets."""
     if frame_count < 1:
@@ -105,8 +170,11 @@ class Settings:
     kv_cache: str = "auto"
     # auto | match_context | integer token count as string (e.g. "8192")
     kv_capacity: str = "auto"
+    prefill_chunk: int = 1024
     cuda_graphs: str = "auto"
     thinking: str = "auto"
+    thinking_budget: int = 0
+    reasoning_loop: str = "off"
     speculation: dict = field(default_factory=lambda: {"speculation": "off"})
     sampling: dict = field(default_factory=default_sampling)
     image_max_side: int = 0
@@ -151,7 +219,7 @@ def check_artifact_runtime(artifact, help_text):
 
 
 
-def resolve_kv_capacity(settings, *, has_images=False, has_video=False):
+def resolve_kv_capacity(settings, *, has_images=False, has_video=False, family="qwen"):
     """Choose --kv-capacity value for this build.
 
     ``auto`` leaves a fixed 1024 MiB sizing headroom (ninfer 0.6.x). That headroom
@@ -170,7 +238,9 @@ def resolve_kv_capacity(settings, *, has_images=False, has_video=False):
                 'Ninferencing: kv_capacity must be "auto", "match_context", or a positive token count.'
             )
         return str(int(mode))
-    if has_video:
+    if has_video or family == "qwen_moe":
+        # qwen_moe: the 35B's text weights alone are 19.6 GiB; auto's extra 1 GiB headroom
+        # is what pushes a 32K request past a 24 GB card shared with a desktop + ComfyUI.
         return str(context)
     return "auto"
 
@@ -198,8 +268,7 @@ def is_vision_residency_failure(text: str | None) -> bool:
     Newer builds fail startup with e.g. "--vision-residency overlay needs
     816 MiB of evict-ranked weights for one encode window, but ... provide
     656 MiB; lower --vision-max-merged, use --vision-residency resident, or
-    drop a flag that shrinks those weights". Both the image and video nodes
-    share build_command, so both need the same retry.
+    drop a flag that shrinks those weights".
 
     Flag names alone are not enough: any usage error prints --help, and that
     text mentions both --vision-residency and --vision-max-merged. Matching
@@ -214,6 +283,25 @@ def is_vision_residency_failure(text: str | None) -> bool:
     return "encode window" in lowered and (
         "vision-residency" in lowered or "vision-max-merged" in lowered
     )
+
+
+def estimate_still_tokens(long_sides, side_cap) -> int:
+    """Rough still-image vision tokens after the side cap.
+
+    One merged-token grid of ``g = side // 32`` costs ``g * g`` tokens (exact
+    for square stills against the node's budget table). Used for the
+    node-side pre-flight check, not for sizing.
+    """
+    cap = max(0, int(side_cap or 0))
+    total = 0
+    for side in long_sides:
+        try:
+            fitted = min(int(side), cap) if cap > 0 else int(side)
+        except (TypeError, ValueError):
+            continue
+        grid = fitted // 32
+        total += grid * grid
+    return total
 
 
 def sampling_limits(help_text: str | None) -> dict[str, tuple[float, float]]:
@@ -393,7 +481,154 @@ def expand_command_for_prompt_capacity(command, diagnostics=None):
     return new_cmd
 
 
-def build_command(executable, artifact, messages, settings, flags, help_text, *, max_tokens, seed, device, has_images, has_video=False, video_fps=2):
+QWEN_MOE_MIN_CONTEXT = 4096
+
+
+def _set_capacity(command, tokens):
+    new_cmd = list(command)
+    if "--kv-capacity" in new_cmd:
+        new_cmd[new_cmd.index("--kv-capacity") + 1] = str(tokens)
+    if "--max-context" in new_cmd:
+        idx = new_cmd.index("--max-context")
+        if int(new_cmd[idx + 1]) > tokens:
+            new_cmd[idx + 1] = str(tokens)
+    return new_cmd
+
+
+def tighten_qwen_moe_for_capacity(command, diagnostics, flags=None):
+    """qwen_moe capacity retry: size KV from the engine's own numbers, or move weights.
+
+    Shrinking context only saves KV bytes (5600-10560 B/token), so the generic
+    32K->16K->12K->8K ladder cannot fix a shortfall made of weights. Here:
+    1. If ninfer printed its reservation arithmetic, compute the largest capacity that fits
+       (one step, not a ladder) and retry with it, as long as it is >= QWEN_MOE_MIN_CONTEXT.
+    2. Otherwise (raw cudaMalloc OOM, or even the minimum KV does not fit) the shortfall is
+       weights-bound: retry once with routed experts in pinned host memory
+       (--expert-residency host), which frees ~16.4 GiB of device weights.
+    Returns (new_command or None, reason).
+    """
+    terms = qwen_moe_memory_terms(command)
+    parsed = parse_reservation_shortfall(diagnostics)
+    per_token = max(1.0, terms["kv_per_token"])
+    if parsed is not None and "--kv-capacity" in command:
+        if parsed["kind"] == "requested":
+            non_kv = max(0, parsed["required"] - terms["kv_bytes"])
+        else:
+            # auto: "minimum" is the smallest reservation; going explicit drops the headroom.
+            non_kv = parsed["required"]
+        fit = int((parsed["available"] - non_kv) // per_token) // 1024 * 1024
+        current = terms["kv_tokens"] or int(_argv_int(command, "--max-context", 32768))
+        if fit >= QWEN_MOE_MIN_CONTEXT and (terms["kv_tokens"] is None or fit < current):
+            fit = min(fit, current)
+            LOGGER.warning(
+                "Ninferencing: qwen_moe capacity shortfall (%s available, %s non-KV); "
+                "retrying with --kv-capacity %s (largest that fits) instead of a blind ladder",
+                format_bytes(parsed["available"]), format_bytes(non_kv), fit,
+            )
+            return _set_capacity(command, fit), "kv"
+    lighter, step = qwen_moe_lighter_residency(command, flags)
+    if lighter is not None:
+        LOGGER.warning(
+            "Ninferencing: qwen_moe shortfall is weights-bound (fixed ~%s before KV); retrying "
+            "with %s",
+            format_bytes(terms["fixed"]), " ".join(lighter[len(command):]) or step,
+        )
+        return lighter, step
+    return None, "weights"
+
+
+# Free VRAM the pre-launch fit keeps beyond the estimate (driver/desktop drift between the
+# handoff measurement and ninfer's own cuMemCreate of the weight arena).
+QWEN_MOE_FIT_MARGIN = 512 * 1024 * 1024
+QWEN_MOE_HOST_PREFILL_CHUNK = 4096
+
+
+def qwen_moe_lighter_residency(command, flags=None):
+    """Next, cheapest move of weights off the GPU, or (None, "weights").
+
+    1. --embedding-residency host: the 515 MiB untied token embedding goes to pinned host memory
+       and the gather reads one row per token over the bus; output unchanged, decode ~unchanged.
+    2. --expert-residency host: routed experts (17.3 GiB) in pinned RAM; the GPU keeps two layer
+       banks and an automatic expert cache sized from what is left (partial residency). The
+       engine's own prefill default for host experts is 4096, so the node's default 1024 is
+       raised to it.
+    Never overrides a residency flag already on the argv (Settings extra_args included).
+    """
+    flags = flags or ()
+    cmd = list(command)
+    if "--expert-residency" in cmd:
+        return None, "weights"
+    if ("--embedding-residency" not in cmd and "--embedding-residency" in flags
+            and "--embedding-q4" not in cmd and "--embedding-q6" not in cmd):
+        return cmd + ["--embedding-residency", "host"], "embedding"
+    if "--expert-residency" in flags:
+        out = cmd + ["--expert-residency", "host"]
+        if "--prefill-chunk" in out:
+            idx = out.index("--prefill-chunk")
+            if idx + 1 < len(out) and out[idx + 1] == "1024":
+                out[idx + 1] = str(QWEN_MOE_HOST_PREFILL_CHUNK)
+        return out, "experts"
+    return None, "weights"
+
+
+def fit_qwen_moe_residency(command, free_bytes, flags=None, margin=QWEN_MOE_FIT_MARGIN):
+    """Pick the fastest residency whose estimated need + margin fits free_bytes.
+
+    Runs after the VRAM handoff, on the measured free memory, so ninfer is not launched into a
+    weight arena that cannot be backed. Returns (command, steps taken).
+    """
+    cmd = list(command)
+    steps = []
+    if free_bytes is None:
+        return cmd, steps
+    while qwen_moe_memory_terms(cmd)["total"] + margin > free_bytes:
+        lighter, step = qwen_moe_lighter_residency(cmd, flags)
+        if lighter is None:
+            break
+        cmd = lighter
+        steps.append(step)
+    if steps:
+        LOGGER.warning(
+            "Ninferencing: qwen_moe needs ~%s + %s margin with weights on the GPU but %s is free; "
+            "launching with %s (estimated need %s)",
+            format_bytes(qwen_moe_memory_terms(command)["total"]), format_bytes(margin),
+            format_bytes(free_bytes), " ".join(cmd[len(command):]),
+            format_bytes(qwen_moe_memory_terms(cmd)["total"]),
+        )
+    return cmd, steps
+
+
+def _argv_int(command, flag, default):
+    if flag in command:
+        try:
+            return int(command[command.index(flag) + 1])
+        except (ValueError, IndexError):
+            return default
+    return default
+
+
+def qwen_moe_weights_bound_message(command, diagnostics, report):
+    terms = qwen_moe_memory_terms(command)
+    free = (report or {}).get("after_free")
+    lines = [
+        "Ninferencing: Qwen3.6-35B-A3B does not fit in free VRAM, and shrinking context would not "
+        "help: the shortfall is in weights, not KV.",
+        f"Estimated device need {format_bytes(terms['total'])} = weights {format_bytes(terms['weights'])}"
+        f" + engine/CUDA {format_bytes(terms['fixed'] - terms['weights'] - terms['vision'])}"
+        f" + vision {format_bytes(terms['vision'])} + KV {format_bytes(terms['kv_bytes'])}"
+        f" ({terms['kv_dtype']}, {terms['kv_tokens'] or 'auto'} tokens)"
+        + (f"; free was {format_bytes(free)}." if free is not None else "."),
+        "Ways to fit: Settings extra_args [\"--embedding-residency\", \"host\"] (-515 MiB, output "
+        "unchanged) or [\"--expert-residency\", \"host\"] (experts in pinned RAM, "
+        "~16 GiB off the GPU); kv_cache rk4v4; kv_capacity match_context; speculation off or MTP "
+        "(MTP adds ~0.65 GiB with --mtp-experts-q4); vision stays overlay (or "
+        "[\"--vision-residency\", \"cpu\"]); close GPU-heavy desktop apps.",
+    ]
+    lines.append((diagnostics or "").strip())
+    return "\n".join(lines)
+
+
+def build_command(executable, artifact, messages, settings, flags, help_text, *, max_tokens, seed, device, has_images, has_video=False, family="qwen"):
     extra = json.loads(settings.extra_args or "[]")
     if not isinstance(extra, list) or not all(isinstance(arg, str) for arg in extra):
         raise ValueError('Ninferencing: extra_args must be a JSON array of strings, e.g. ["--prefill-chunk", "256"].')
@@ -421,12 +656,25 @@ def build_command(executable, artifact, messages, settings, flags, help_text, *,
     # Text/still: auto sizes KV to remaining VRAM (1024 MiB headroom). Native video: explicit
     # capacity matching context — auto's headroom does not fit beside vision engine on 24 GB.
     if "--kv-capacity" in flags:
-        add("--kv-capacity", resolve_kv_capacity(settings, has_images=has_images, has_video=has_video))
+        add("--kv-capacity", resolve_kv_capacity(settings, has_images=has_images, has_video=has_video, family=family))
     if "--prefill-chunk" in flags:
-        add("--prefill-chunk", 512)
+        try:
+            chunk = int(settings.prefill_chunk)
+        except (TypeError, ValueError):
+            raise ValueError("Ninferencing: prefill_chunk must be a positive multiple of 128.")
+        if chunk < 1 or chunk % 128:
+            raise ValueError("Ninferencing: prefill_chunk must be a positive multiple of 128.")
+        add("--prefill-chunk", chunk)
 
     if settings.kv_cache != "auto":
         add("--kv-dtype", settings.kv_cache)
+    elif family == "qwen_moe" and re.search(r"--kv-dtype[^\n\]]*\brk4v4\b", help_text):
+        # Qwen3.6-35B-A3B: rk4v4 is 5600 B/token vs INT8's 10560 at ~the same decode speed
+        # (config-calculator); halves KV so 32K-131K fit beside the 19.6 GiB of weights.
+        add("--kv-dtype", "rk4v4")
+    elif family == "gemma4" and re.search(r"--kv-dtype[^\n\]]*\brk8v4\b", help_text):
+        # docs/gemma4.md: rk8v4 is the recommended 3090 default for Gemma 4 A4B.
+        add("--kv-dtype", "rk8v4")
     elif re.search(r"--kv-dtype[^\n\]]*\bint8\b", help_text):
         add("--kv-dtype", "int8")
     if "--gdn-state-fp16" in flags:
@@ -437,12 +685,49 @@ def build_command(executable, artifact, messages, settings, flags, help_text, *,
         add("--no-thinking")
     elif settings.thinking not in {"auto", "model default"}:
         add("--reasoning-effort", settings.thinking)
-    spec = settings.speculation
-    if spec["speculation"] != "off":
-        add("--spec", spec["speculation"])
-        add("--draft-tokens", spec["draft_tokens"])
-        if spec["lm_head_draft"]:
+    try:
+        budget = int(settings.thinking_budget or 0)
+    except (TypeError, ValueError):
+        raise ValueError("Ninferencing: thinking_budget must be 0 (off) or a positive token count.")
+    if budget > 0:
+        if family == "gemma4":
+            # docs/gemma4.md: Gemma has no early-close control; thinking budgets do not apply.
+            LOGGER.warning(
+                "Ninferencing: thinking_budget is ignored for Gemma 4 (no early-close control)."
+            )
+        else:
+            add("--thinking-budget", budget)
+    loop = str(settings.reasoning_loop or "off").strip().lower()
+    if loop not in {"off", "stop", "conclude"}:
+        raise ValueError('Ninferencing: reasoning_loop must be "off", "stop", or "conclude".')
+    if loop != "off":
+        add("--reasoning-loop", loop)
+    spec = dict(settings.speculation)
+    mode = spec.get("speculation", "off")
+    if family == "gemma4" and mode in {"dflash", "dflash2"}:
+        # Gemma 4 ships MTP, not DFlash. Remap so a leftover Settings choice still runs.
+        LOGGER.warning(
+            "Ninferencing: Gemma 4 uses MTP, not %s; using --spec mtp instead.",
+            mode,
+        )
+        mode = "mtp"
+        spec["speculation"] = "mtp"
+    if mode != "off":
+        add("--spec", mode)
+        try:
+            drafts = int(spec["draft_tokens"])
+        except (TypeError, ValueError):
+            raise ValueError("Ninferencing: draft_tokens must be an integer 1..15 (engine limit).")
+        if not 1 <= drafts <= 15:
+            raise ValueError(
+                f"Ninferencing: draft_tokens must be 1..15 (engine limit), not {spec['draft_tokens']!r}."
+            )
+        add("--draft-tokens", drafts)
+        if spec.get("lm_head_draft"):
             add("--lm-head-draft")
+        if family == "qwen_moe" and mode == "mtp" and "--mtp-experts-q4" in flags:
+            # About -350 MiB of MTP weights; drafts are verified, acceptance 61.2% -> 60.6%.
+            add("--mtp-experts-q4")
     if settings.sampling.get("sampling") == "custom":
         limits = sampling_limits(help_text)
         for key, value in settings.sampling.items():
@@ -459,22 +744,12 @@ def build_command(executable, artifact, messages, settings, flags, help_text, *,
             add("--vision-residency", "overlay")
         if "--vision-max-merged" in flags:
             add("--vision-max-merged", VISION_MAX_MERGED)
-        try:
-            fps = int(video_fps)
-        except (TypeError, ValueError):
-            fps = 2
-        if has_video and fps != 2:
-            if "--video-fps" not in flags:
-                raise ValueError(
-                    "Ninferencing: video_fps is not 2, but this ninfer build does not advertise "
-                    "--video-fps. Install the cicalooo/ninfer-linux build with that flag, or leave video_fps at 2."
-                )
-            add("--video-fps", fps)
     command.extend(extra)
     return command
 
 
-def generate(command, timeout, check_cancel, temp_dir, *, on_capacity=None, vram_report=None, tighten_on_capacity=True):
+def generate(command, timeout, check_cancel, temp_dir, *, on_capacity=None, vram_report=None, tighten_on_capacity=True,
+             family="qwen", flags=None):
     """Run ninfer. On capacity failure: reclaim VRAM, then optionally retry with tighter KV.
 
     Still-image multimodal may need a mid-context tighten (16K/12K) before the 8K
@@ -482,7 +757,11 @@ def generate(command, timeout, check_cancel, temp_dir, *, on_capacity=None, vram
     once more by expanding context/KV upward instead of stripping vision.
     Vision overlay shortfall (--vision-residency overlay needs N MiB of
     evict-ranked weights) retries with a smaller --vision-max-merged, then
-    resident. Image and video nodes share build_command, so both paths retry.
+    resident.
+
+    Returns (text, thinking): the answer from stdout and the reasoning stream
+    from stderr with engine logs and the trailing summary removed
+    (see extract_reasoning). When thinking is off the stream is empty.
     """
     last_report = vram_report
     active = list(command)
@@ -500,17 +779,23 @@ def generate(command, timeout, check_cancel, temp_dir, *, on_capacity=None, vram
     else:
         attempts = 3 if has_vision else 1
     diagnostics = ""
+    thinking = ""
     for attempt in range(attempts):
-        code, text, diagnostics = run_process(
+        code, text, full = run_process(
             active, cwd=Path(active[0]).parent, timeout=timeout, check_cancel=check_cancel, temp_dir=temp_dir,
+            tail_limit=None,
         )
+        # Error classification and messages use the bounded tail (as before);
+        # the thinking output keeps the extracted reasoning stream.
+        diagnostics = full[-12288:].strip()
+        thinking = extract_reasoning(full)
         if code == 0:
             text = text.strip()
             if not text:
                 raise RuntimeError(
                     "Ninferencing: ninfer returned no answer. Increase max_tokens or turn thinking off.\n" + diagnostics
                 )
-            return text
+            return text, thinking
         if attempt + 1 < attempts:
             if is_vision_residency_failure(diagnostics):
                 shrunk = tighten_command_for_vision(active, diagnostics)
@@ -518,6 +803,14 @@ def generate(command, timeout, check_cancel, temp_dir, *, on_capacity=None, vram
                     active = shrunk
                     has_vision = "--vision" in active
                     continue
+            if family == "qwen_moe" and is_capacity_failure(diagnostics):
+                retry, reason = tighten_qwen_moe_for_capacity(active, diagnostics, flags)
+                if retry is None:
+                    raise RuntimeError(qwen_moe_weights_bound_message(active, diagnostics, last_report))
+                if on_capacity is not None:
+                    last_report = on_capacity() or last_report
+                active = retry
+                continue
             if is_capacity_failure(diagnostics):
                 tightened = tighten_command_for_capacity(active, diagnostics) if tighten_on_capacity else None
                 if tightened is not None and tightened != active:
@@ -535,6 +828,8 @@ def generate(command, timeout, check_cancel, temp_dir, *, on_capacity=None, vram
                         last_report = on_capacity() or last_report
                     active = expanded
                     continue
+        if family == "qwen_moe" and is_capacity_failure(diagnostics):
+            raise RuntimeError(qwen_moe_weights_bound_message(active, diagnostics, last_report))
         if is_capacity_failure(diagnostics):
             raise RuntimeError(capacity_error_message(diagnostics, last_report))
         if is_prompt_context_failure(diagnostics):

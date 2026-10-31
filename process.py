@@ -99,8 +99,13 @@ class ProcessOwner:
         self.process = None
 
 
-def run_process(command, *, cwd, timeout, check_cancel, temp_dir=None):
-    """Return stdout and a bounded diagnostic tail; never leave a live child."""
+def run_process(command, *, cwd, timeout, check_cancel, temp_dir=None, tail_limit=12288):
+    """Return stdout and a diagnostic tail; never leave a live child.
+
+    ``tail_limit`` bounds how much of stderr is returned (oldest output is
+    dropped first). ``None`` returns all of stderr. The default keeps the
+    long-standing 12288-character bound used for error messages.
+    """
     check_cancel()
     with tempfile.TemporaryFile(dir=temp_dir) as output, tempfile.TemporaryFile(dir=temp_dir) as diagnostics:
         owner = ProcessOwner()
@@ -118,7 +123,10 @@ def run_process(command, *, cwd, timeout, check_cancel, temp_dir=None):
             output.seek(0)
             text = output.read().decode("utf-8", errors="replace")
             diagnostics.seek(0, os.SEEK_END)
-            diagnostics.seek(max(0, diagnostics.tell() - 12288))
+            if tail_limit is None:
+                diagnostics.seek(0)
+            else:
+                diagnostics.seek(max(0, diagnostics.tell() - tail_limit))
             tail = diagnostics.read().decode("utf-8", errors="replace").strip()
             return code, text, tail
         finally:

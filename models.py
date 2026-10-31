@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 import shutil
 import struct
@@ -46,6 +47,34 @@ def artifact_container_version(path):
     if len(header) < 8 or header[:6] != b"NINFER":
         return None
     return struct.unpack_from(">H", header, 6)[0]
+
+
+def detect_artifact_family(path):
+    """Best-effort family for node defaults (KV, spec, vision planning).
+
+    Returns ``"gemma4"`` for Gemma 4 A4B artifacts, ``"qwen_moe"`` for the
+    Qwen3.6-35B-A3B MoE (same Qwen frontend, but its own VRAM model and KV/MTP
+    defaults), otherwise ``"qwen"`` (Qwen3.x / Bonsai / Flash-Next share the
+    Qwen frontend path this pack already targets). Filename heuristics cover
+    the WaveCut/Google names; a short ASCII scan of the artifact directory blob
+    catches renames. Callers test ``family == "gemma4"``, so ``qwen_moe``
+    follows every Qwen code path.
+    """
+    name = Path(path).name.lower()
+    if re.search(r"gemma[-_]?4|gemma4", name):
+        return "gemma4"
+    moe_name = bool(re.search(r"35b[-_.]?a3b", name))
+    try:
+        with open(path, "rb") as handle:
+            blob = handle.read(256 * 1024)
+    except OSError:
+        return "qwen_moe" if moe_name else "qwen"
+    markers = (b"Gemma4ForCausalLM", b"gemma4_gguf", b"Gemma4ForConditionalGeneration")
+    if any(marker in blob for marker in markers):
+        return "gemma4"
+    if moe_name or b"Qwen3_5MoeForCausalLM" in blob or b"qwen3_5_moe" in blob:
+        return "qwen_moe"
+    return "qwen"
 
 
 def resolve_executable(value):

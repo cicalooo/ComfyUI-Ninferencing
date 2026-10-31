@@ -12,7 +12,7 @@ import folder_paths
 from comfy import model_management
 from comfy_api.latest import io
 
-from .models import default_executable, resolve_executable, resolve_model
+from .models import default_executable, detect_artifact_family, resolve_executable, resolve_model
 from .runtime import (
     QWEN38_NOTHINK_SAMPLING,
     VISION_ITEM_LIMIT,
@@ -20,11 +20,20 @@ from .runtime import (
     Settings,
     build_command,
     check_artifact_runtime,
+    estimate_still_tokens,
+    fit_qwen_moe_residency,
     generate,
     probe_runtime,
     vision_side_limit,
 )
-from .videosample import build_clip, fit_side_for_tokens, ninfer_video_plan, probe_video
+from .videosample import (
+    build_clip,
+    fit_side_for_tokens,
+    gemma_still_tokens,
+    gemma_video_plan,
+    ninfer_video_plan,
+    probe_video,
+)
 
 LOGGER = logging.getLogger(__name__)
 from .vram import estimate_need_bytes, prepare_for_ninfer
@@ -34,10 +43,6 @@ SettingsType = io.Custom("NINFERENCING_SETTINGS")
 # CF Image Bin cable: ordered tuple of [1,H,W,C] IMAGE tensors. Match the string; do not import the other pack.
 CF_REFS_TYPE = "CF_REFS"
 _execution_lock = threading.Lock()
-_SYSTEM_PROMPT = (
-    "Improve the user's image-generation prompt. Preserve their intent and add concrete visual detail. "
-    "Reply with only the finished prompt, without a preamble or analysis."
-)
 
 
 def first(value):
@@ -70,17 +75,6 @@ def image_frames(value):
             yield from image_frames(item)
     elif value is not None:
         yield from value
-
-
-def _video_duration(video):
-    """Best-effort source length in seconds, or None when unavailable."""
-    try:
-        duration = float(video.get_duration())
-    except Exception:
-        return None
-    if duration != duration:  # NaN
-        return None
-    return duration
 
 
 def _pending_file_trim(video):
@@ -242,199 +236,116 @@ def limit_image_frames(images, budget):
     return limited
 
 
-# Legacy "sampled" mode only: frames reserved for the thinned clip out of the
-# still budget. 0 = original behaviour (stills keep VISION_ITEM_LIMIT - 1).
-VIDEO_MIN_FRAMES = 0
-# "full" mode: ninfer decodes the clip itself at a chosen fps (default 2, min 4, max
-# 768 frames) with real timestamps; a native video_url is one media item.
-VIDEO_FULL_MAX_SECONDS = 16.0
+# Full-clip video only: ninfer decodes the clip itself at its baked 2 fps with
+# real timestamps; a native video_url is one media item.
 VIDEO_FULL_DEFAULT_SIDE = 512
-VIDEO_MODES = ("full", "sampled (legacy)")
-VIDEO_FPS_CHOICES = ("2", "3", "4", "5", "6")
-DEFAULT_VIDEO_FPS = 2
 
 
-def parse_video_fps(value):
-    raw = first(value) if not isinstance(value, (int, float)) else value
-    try:
-        fps = int(raw)
-    except (TypeError, ValueError):
-        fps = DEFAULT_VIDEO_FPS
-    if fps not in (2, 3, 4, 5, 6):
-        raise ValueError(f"Ninferencing: video_fps must be 2, 3, 4, 5 or 6, not {value!r}.")
-    return fps
+def fit_video_for_vision(video, directory, *, video_max_side=0,
+                         token_budget=None, video_duration=0.0, family="qwen"):
+    """Export the full clip as a video_url file. Returns (path, video_tokens).
 
+    The loader owns all windowing: every input is treated as start-0 full
+    input and the clip is sent whole — never trimmed or capped. ``video_max_side``
+    downscales the longest edge (even dimensions) so large plates fit the
+    vision token budget. ``video_duration`` (0 = probe the file) overrides the
+    plate length used for planning and logging when container metadata is
+    unreliable; it never cuts the clip.
 
-def fit_video_for_vision(video, directory, *, start_seconds=0.0, duration_seconds=0.0, max_frames=VISION_ITEM_LIMIT, video_max_side=0,
-                         mode="sampled (legacy)", max_seconds=VIDEO_FULL_MAX_SECONDS, token_budget=None,
-                         video_fps=DEFAULT_VIDEO_FPS):
-    """Export a video_url file whose frame count ninfer will accept.
-
-    A long plate is not rejected. Frames are spread across the clip so a 15s
-    plate still describes the whole action, and the result keeps the source
-    length (``videosample`` picks the output rate), so an analysis timeline in
-    ``[MM:SS.mmm]`` still maps onto the plate it came from. Decoding is
-    streamed from the exported file — the plate is never pulled into a tensor
-    batch just to be thinned.
-
-    When ``video_max_side`` > 0 the clip is also downscaled (longest edge, even
-    dimensions) so large plates do not exhaust vision context.
+    ``video_tokens`` is the planned native-video vision cost (ninfer samples
+    the clip itself at its baked 2 fps), so stills can be sized against what
+    remains of ``context_length``.
     """
-    full = mode == "full"
-    if full and max_seconds and max_seconds > 0:
-        if not duration_seconds or duration_seconds <= 0 or duration_seconds > max_seconds:
-            source = video_duration_seconds(video)
-            remaining = None if source is None else max(0.0, source - float(start_seconds or 0.0))
-            wanted = duration_seconds if duration_seconds and duration_seconds > 0 else remaining
-            if wanted is None or wanted > max_seconds:
-                LOGGER.info("Ninferencing: full-clip video capped at %.1f s (video_max_seconds).", max_seconds)
-                duration_seconds = float(max_seconds)
-    exported = export_video_path(
-        video, directory, start_seconds=start_seconds, duration_seconds=duration_seconds,
-    )
+    exported = export_video_path(video, directory)
     try:
         side = int(video_max_side or 0)
     except (TypeError, ValueError):
         side = 0
     if side < 0:
         side = 0
-    if max_frames < 1:
-        return exported
     info = probe_video(exported)
     if info is None:
         # Not a container we can inspect (or PyAV refused it): send as-is and
         # let the CLI report what it could not read.
-        return exported
-    if full:
-        if side <= 0:
-            side = VIDEO_FULL_DEFAULT_SIDE
-        if token_budget:
-            fitted = fit_side_for_tokens(
-                info.width, info.height, info.frame_count, info.rate, side, token_budget, fps=video_fps,
+        return exported, 0
+    try:
+        claimed = float(video_duration or 0.0)
+    except (TypeError, ValueError):
+        claimed = 0.0
+    if claimed > 0 and abs(claimed - info.duration) / max(info.duration, 1e-6) > 0.05:
+        LOGGER.info(
+            "Ninferencing: video_duration %.2f s differs from probed %.2f s; "
+            "reporting video_duration, planning from probed frames.",
+            claimed, info.duration,
+        )
+    if info.frame_count <= 5 or info.duration < 1.0:
+        LOGGER.info(
+            "Ninferencing: image-as-video suspected (%d frames, %.3f s); sending as native video_url anyway.",
+            info.frame_count, info.duration,
+        )
+    if side <= 0:
+        side = VIDEO_FULL_DEFAULT_SIDE
+    # Gemma soft-token cost is fixed per frame; Qwen cost scales with the grid, so
+    # only the Qwen path shrinks max_side against token_budget.
+    if token_budget and family != "gemma4":
+        fitted = fit_side_for_tokens(
+            info.width, info.height, info.frame_count, info.rate, side, token_budget,
+        )
+        if fitted < side and max(info.width, info.height) > fitted:
+            LOGGER.info("Ninferencing: video_max_side %d -> %d to keep the clip within %d vision tokens.",
+                        side, fitted, token_budget)
+            side = fitted
+    clip = build_clip(info, Path(directory) / "input_video_full.mp4", max_side=side)
+    final = probe_video(clip) if clip is not None else info
+    tokens = 0
+    if final is not None:
+        if family == "gemma4":
+            frames, w, h, tokens, stamps = gemma_video_plan(final.frame_count, final.rate)
+            LOGGER.info(
+                "Ninferencing: full clip %.2f s @ %.3f fps, %dx%d -> Gemma samples %d frames evenly, "
+                "~%d vision tokens, timestamps %.2f..%.2f s.",
+                claimed if claimed > 0 else final.duration, float(final.rate), final.width, final.height, frames,
+                tokens,
+                stamps[0] if stamps else 0.0, stamps[-1] if stamps else 0.0,
             )
-            if fitted < side and max(info.width, info.height) > fitted:
-                LOGGER.info("Ninferencing: video_max_side %d -> %d to keep the clip within %d vision tokens.",
-                            side, fitted, token_budget)
-                side = fitted
-        clip = build_clip(info, Path(directory) / "input_video_full.mp4", max_frames=0, max_side=side, full=True)
-        final = probe_video(clip) if clip is not None else info
-        if final is not None:
+        else:
             frames, w, h, tokens, stamps = ninfer_video_plan(
-                final.width, final.height, final.frame_count, final.rate, fps=video_fps,
+                final.width, final.height, final.frame_count, final.rate,
             )
             LOGGER.info(
-                "Ninferencing: full clip %.2f s @ %.3f fps, %dx%d -> ninfer samples %d frames at %.0f fps, "
+                "Ninferencing: full clip %.2f s @ %.3f fps, %dx%d -> ninfer samples %d frames at baked 2 fps, "
                 "vision grid %dx%d, ~%d vision tokens, timestamps %.2f..%.2f s.",
-                final.duration, float(final.rate), final.width, final.height, frames, video_fps,
+                claimed if claimed > 0 else final.duration, float(final.rate), final.width, final.height, frames,
                 w, h, tokens, stamps[0] if stamps else 0.0, stamps[-1] if stamps else 0.0,
             )
-        return clip if clip is not None else exported
-    clip = build_clip(
-        info, Path(directory) / "input_video_sampled.mp4",
-        max_frames=max_frames, max_side=side,
-    )
-    return clip if clip is not None else exported
+    return (clip if clip is not None else exported), tokens
 
 
-def video_duration_seconds(video):
-    """Best-effort source duration of a Comfy VIDEO without decoding frames."""
-    for name in ("get_duration",):
-        getter = getattr(video, name, None)
-        if callable(getter):
-            try:
-                value = float(getter())
-                if value > 0:
-                    return value
-            except Exception:
-                pass
-    return None
-
-
-def export_video_path(video, directory, *, start_seconds=0.0, duration_seconds=0.0):
+def export_video_path(video, directory):
     """Materialize a local file path for ninfer video_url parts.
 
-    Prefer an existing on-disk stream when the clip is untrimmed. Trimmed windows
-    are always re-encoded so ninfer sees the selected span (Comfy trim metadata
-    is not part of the file URL contract).
-
-    When source duration is known, start is clamped into ``[0, duration)`` and a
-    positive requested length is clamped to the remaining span so the window is
-    never empty. A request that already covers the full input skips
-    ``as_trimmed`` (avoids double-trim when Prep already shortened the plate and
-    Duration is still wired into this node). A start at or past EOF raises with
-    diagnostics instead of Comfy's opaque empty-trim ``None``.
+    The loader owns all windowing: every input is treated as start-0 full
+    input, so this never trims. Prefer an existing on-disk stream; re-encode
+    only when the object still carries unbaked trim metadata.
     """
-    from comfy_api.latest import VideoCodec, VideoContainer
-
     if video is None:
         raise ValueError("Ninferencing: connect a VIDEO input.")
-    start = max(0.0, float(start_seconds or 0.0))
-    requested = max(0.0, float(duration_seconds or 0.0))
-    duration = requested
-    source_duration = _video_duration(video)
-
-    if source_duration is not None:
-        if source_duration <= 0.0:
-            raise ValueError(
-                f"Ninferencing: source duration is empty "
-                f"(source_duration={source_duration:.4g}s)."
-            )
-        if start >= source_duration:
-            raise ValueError(
-                "Ninferencing: trim window is past end of clip "
-                f"(source_duration={source_duration:.4g}s, start={start:.4g}s, "
-                f"requested_duration={requested:.4g}s)."
-            )
-        remaining = source_duration - start
-        if duration > 0.0:
-            duration = min(duration, remaining)
-        # Full input after clamp → skip as_trimmed (safe for Prep→Video double-wire).
-        effective_end = source_duration if duration <= 0.0 else start + duration
-        if start <= 0.0 and effective_end >= source_duration - 1e-6:
-            return _reuse_or_save_video(video, directory)
-
-    # Prefer the on-disk stream when untrimmed. Only call as_trimmed when a
-    # window is set. Pass floats (never None): comfy VideoFromComponents.as_trimmed
-    # does `start_time + duration` and TypeErrors on None; VideoFromFile treats
-    # duration=0 as "to end".
-    needs_trim = start > 0.0 or duration > 0.0
-    if not needs_trim:
-        return _reuse_or_save_video(video, directory)
-
-    clip = video.as_trimmed(start_time=start, duration=duration)
-    if clip is None:
-        # After clamp this is rare (float / strict_duration quirks). Fall back to
-        # the untrimmed clip only when the requested window already covered it.
-        if (
-            source_duration is not None
-            and start <= 0.0
-            and (requested <= 0.0 or duration >= source_duration - 1e-6)
-        ):
-            return _reuse_or_save_video(video, directory)
-        detail = (
-            f"source_duration={source_duration:.4g}s, "
-            if source_duration is not None
-            else "source_duration=unknown, "
-        )
-        raise ValueError(
-            "Ninferencing: start/duration trim is empty "
-            f"({detail}start={start:.4g}s, requested_duration={requested:.4g}s, "
-            f"clamped_duration={duration:.4g}s). "
-            "Set duration_seconds to 0 to send the full input."
-        )
-
-    path = Path(directory) / "input_video.mp4"
     model_management.throw_exception_if_processing_interrupted()
-    clip.save_to(str(path), format=VideoContainer.MP4, codec=VideoCodec.H264)
-    return path
+    return _reuse_or_save_video(video, directory)
 
 
-def write_messages(directory, prompt, system_prompt, images, max_side, context_length, video_paths=None):
+def write_messages(directory, prompt, system_prompt, images, max_side, context_length, video_paths=None,
+                    video_token_reserve=0, family="qwen"):
     """Build messages.json for ninfer.
 
     Still images become image_url parts. Native video files become video_url
     parts (ninfer 0.6.x --vision). video_paths are written first so identity
     stills remain the later attachments when both are present.
+
+    ``video_token_reserve`` is the planned native-video vision cost. It is
+    spent from the prompt budget before stills are sized, so a clip plus
+    stills cannot silently overflow ``context_length`` the way an unreserved
+    video side could (the image-as-video 8192 failure).
     """
     pinned, rest = split_ordered_frames(images)
     videos = [Path(path) for path in (video_paths or []) if path]
@@ -452,13 +363,35 @@ def write_messages(directory, prompt, system_prompt, images, max_side, context_l
     frames = pinned + rest
     if pinned:
         LOGGER.info(
-            "Ninferencing: %d CF Image Bin refs as <Picture 1>..<Picture %d>, each saved as its own image.",
-            len(pinned), len(pinned),
+            "Ninferencing: %d CF Image Bin refs first, in bin order, each saved as its own image.",
+            len(pinned),
         )
-    text_tokens = (len(prompt) + len(system_prompt)) // VISION_TOKEN_CHARS
+    try:
+        reserve = max(0, int(video_token_reserve or 0))
+    except (TypeError, ValueError):
+        reserve = 0
+    text_tokens = (len(prompt) + len(system_prompt)) // VISION_TOKEN_CHARS + reserve
     # Native video is one media item for the preprocessor; still side caps only
     # apply to image/frame attachments sharing the request.
-    max_side = vision_side_limit(len(frames), max_side, context_length, text_tokens)
+    if family == "gemma4":
+        # Gemma soft-token budgets are fixed (default 280/image). Side caps still shrink
+        # the carrier PNG; they do not change the soft-token ladder the way Qwen grids do.
+        still_tokens = gemma_still_tokens(len(frames))
+        if max_side <= 0:
+            max_side = 1024  # practical carrier default; processor fits to soft-token budget
+    else:
+        max_side = vision_side_limit(len(frames), max_side, context_length, text_tokens)
+        still_tokens = estimate_still_tokens(
+            (max(int(frame.shape[-3]), int(frame.shape[-2])) for frame in frames), max_side,
+        )
+    if text_tokens + still_tokens > context_length:
+        raise ValueError(
+            "Ninferencing: planned prompt exceeds context_length "
+            f"(text ~{text_tokens - reserve} + video ~{reserve} + stills ~{still_tokens} "
+            f"= ~{text_tokens + still_tokens} > {context_length}). "
+            "Raise context_length (video+stills: 12288–16384 on 24 GB, 64K for a 15 s plate with 4–6 stills), "
+            "send fewer stills, or lower video_max_side/image_max_side."
+        )
     content = []
     for path in videos:
         model_management.throw_exception_if_processing_interrupted()
@@ -470,7 +403,7 @@ def write_messages(directory, prompt, system_prompt, images, max_side, context_l
             pixels = pixels[..., 0]
         image = Image.fromarray(pixels).convert("RGB")
         if max_side > 0:
-            image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+            image.thumbnail((max_side, max_side), Image.Resampling.BILINEAR)
         path = directory / f"image_{len(content)}.png"
         image.save(path, format="PNG")
         content.append({"type": "image_url", "image_url": {"url": str(path)}})
@@ -490,7 +423,7 @@ def write_messages(directory, prompt, system_prompt, images, max_side, context_l
 
 
 def collect_image_sources(images=None, image_list=None, refs=None):
-    """Attachment order: CF Image Bin refs, then autogrow sockets, then image_list."""
+    """Order: CF Image Bin refs first, then autogrow sockets, then image_list."""
     sources = {}
     normalized = normalize_refs(refs)
     if normalized:
@@ -507,10 +440,8 @@ def refs_input():
         "refs",
         optional=True,
         tooltip=(
-            "Ordered refs from CF Image Bin (CF_REFS). Bin order is <Picture 1> onward. "
-            "Each still is saved as its own image and is not thinned. "
-            "If video is connected, the clip stays <Video 1>. "
-            "image_list and the images sockets continue after the bin. "
+            "Ordered refs from CF Image Bin (CF_REFS). Bin order is kept and each "
+            "still is saved as its own image, before image_list and images. "
             "Do not also wire the bin's image_list."
         ),
     )
@@ -524,18 +455,77 @@ def ninfer_model_input():
     ])
 
 
+THINKING_OPTIONS = ("off", "auto", "model default", "low", "medium", "high", "xhigh")
+REASONING_LOOP_OPTIONS = ("off", "stop", "conclude")
+SPECULATION_MODES = ("mtp", "dflash", "dflash2")
+
+
+def _override_thinking(settings, thinking=None, thinking_budget=None, reasoning_loop=None):
+    """Apply Main-node thinking controls over Settings. Returns updated Settings."""
+    node_thinking = first(thinking) if thinking is not None else None
+    node_budget = first(thinking_budget) if thinking_budget is not None else None
+    node_loop = first(reasoning_loop) if reasoning_loop is not None else None
+    overrides = {}
+    if node_thinking in THINKING_OPTIONS:
+        overrides["thinking"] = node_thinking
+    if node_budget is not None:
+        try:
+            overrides["thinking_budget"] = int(node_budget)
+        except (TypeError, ValueError):
+            pass
+    if node_loop in REASONING_LOOP_OPTIONS:
+        overrides["reasoning_loop"] = node_loop
+    if overrides:
+        settings = replace(settings, **overrides)
+    return settings
+
+
+def _override_speculation(settings, speculation=None):
+    """Apply Main-node speculation over Settings. Returns updated Settings."""
+    if speculation is None:
+        return settings
+    node_value = first(speculation) if isinstance(speculation, list) else speculation
+    if isinstance(node_value, str):
+        mode = node_value
+        group = {"speculation": mode}
+        if mode != "off":
+            group.update({"draft_tokens": 3, "lm_head_draft": False})
+    elif isinstance(node_value, dict):
+        group = scalar_group(node_value)
+        mode = group.get("speculation", "off")
+        if isinstance(mode, list):
+            mode = first(mode)
+            group["speculation"] = mode
+    else:
+        return settings
+    mode = group.get("speculation", "off")
+    if mode in ("off", *SPECULATION_MODES):
+        settings = replace(settings, speculation=dict(group))
+    return settings
+
+
 def run_ninfer(*, model, prompt, system_prompt, max_tokens, context_length, image_max_side,
                settings=None, images=None, image_list=None, refs=None,
-               video=None, start_at_timestamp=0.0, duration_seconds=0.0, video_max_side=0,
-               video_paths=None, has_video=False, video_mode="full", video_max_seconds=VIDEO_FULL_MAX_SECONDS,
-               video_fps=DEFAULT_VIDEO_FPS):
-    """CLI invocation. Optional video is a native video_url; stills stay image_url."""
+               video=None, video_max_side=0,
+               video_duration=0.0,
+               thinking=None, thinking_budget=None, reasoning_loop=None,
+               speculation=None):
+    """CLI invocation. Optional video is a native video_url; stills stay image_url.
+
+    Returns (text, thinking): the answer and the reasoning stream (stderr).
+    """
     settings = replace(
         first(settings) or Settings(),
         context_length=first(context_length),
         image_max_side=first(image_max_side),
     )
+    settings = _override_thinking(
+        settings, thinking=thinking,
+        thinking_budget=thinking_budget, reasoning_loop=reasoning_loop,
+    )
+    settings = _override_speculation(settings, speculation=speculation)
     artifact = resolve_model(scalar_group(model))
+    family = detect_artifact_family(artifact)
     executable = resolve_executable(settings.executable)
     check_cancel = model_management.throw_exception_if_processing_interrupted
     while not _execution_lock.acquire(timeout=0.1):
@@ -548,60 +538,57 @@ def run_ninfer(*, model, prompt, system_prompt, max_tokens, context_length, imag
         with tempfile.TemporaryDirectory(prefix="ninferencing-", dir=temp_root) as temporary:
             directory = Path(temporary)
             sources = collect_image_sources(images, image_list, refs)
-            paths = [Path(path) for path in (video_paths or []) if path]
+            paths = []
             clip = connected(video)
+            text_prompt = first(prompt)
+            video_tokens = 0
             if clip is not None:
                 still_count = sum(1 for _ in image_frames(list(sources.values())))
-                # A native video_url is ONE media item; stills keep the original
-                # VISION_ITEM_LIMIT - 1 budget. VIDEO_MIN_FRAMES (legacy, opt-in) can
-                # reserve frames for the thinned clip out of that budget.
-                mode = first(video_mode) or "full"
+                # A native video_url is ONE media item; stills keep the
+                # VISION_ITEM_LIMIT - 1 budget.
                 still_budget = max(0, VISION_ITEM_LIMIT - 1)
-                if mode != "full" and VIDEO_MIN_FRAMES > 0:
-                    pinned_count = len(split_ordered_frames(sources)[0])
-                    still_budget = min(still_budget, max(VISION_ITEM_LIMIT - VIDEO_MIN_FRAMES, pinned_count))
                 if still_count > still_budget:
                     sources = limit_image_frames(sources, still_budget)
-                    still_count = still_budget
-                fps = parse_video_fps(video_fps)
-                paths.append(fit_video_for_vision(
+                clip_path, video_tokens = fit_video_for_vision(
                     clip, directory,
-                    start_seconds=float(first(start_at_timestamp) or 0.0),
-                    duration_seconds=float(first(duration_seconds) or 0.0),
-                    max_frames=max(1, VISION_ITEM_LIMIT - still_count),
                     video_max_side=first(video_max_side) or 0,
-                    mode=mode,
-                    max_seconds=float(first(video_max_seconds) or 0.0),
                     # Leave room for text, stills and output inside context_length.
                     token_budget=max(512, min(8192, int(settings.context_length) // 3)),
-                    video_fps=fps,
-                ))
+                    video_duration=float(first(video_duration) or 0.0),
+                    family=family,
+                )
+                paths.append(clip_path)
             messages, has_media = write_messages(
-                directory, first(prompt), first(system_prompt),
+                directory, text_prompt, first(system_prompt),
                 sources,
                 settings.image_max_side, settings.context_length,
                 video_paths=paths,
+                video_token_reserve=video_tokens,
+                family=family,
             )
             if clip is not None and not has_media:
                 raise ValueError("Ninferencing: video export produced no media for ninfer.")
             comfy_device = model_management.get_torch_device()
             device = settings.device if settings.device >= 0 else (comfy_device.index or 0)
-            use_video = bool(has_video or paths)
+            use_video = bool(paths)
             command = build_command(
                 executable, artifact, messages, settings, flags, help_text,
                 max_tokens=first(max_tokens), seed=settings.seed, device=device,
-                has_images=has_media, has_video=use_video,
-                video_fps=parse_video_fps(video_fps) if use_video else DEFAULT_VIDEO_FPS,
+                has_images=has_media, has_video=use_video, family=family,
             )
-            need = estimate_need_bytes(artifact, has_media, has_video=use_video)
+            need = estimate_need_bytes(artifact, has_media, has_video=use_video, family=family, command=command)
             report = prepare_memory(device, need_bytes=need, check_cancel=check_cancel)
-            text = generate(
+            if family == "qwen_moe":
+                command, _steps = fit_qwen_moe_residency(command, (report or {}).get("after_free"), flags)
+            text, thinking = generate(
                 command, settings.timeout, check_cancel, directory,
                 on_capacity=lambda: prepare_memory(device, need_bytes=need, check_cancel=check_cancel),
                 vram_report=report,
                 tighten_on_capacity=True,
+                family=family,
+                flags=flags,
             )
-        return text
+        return text, thinking
     finally:
         _execution_lock.release()
 
@@ -614,58 +601,38 @@ class Ninferencing(io.ComfyNode):
             node_id="Ninferencing", display_name="Ninferencing", category="Ninferencing",
             description=(
                 "Generate text with your local ninfer build. Optional VIDEO is a native video_url "
-                "(<Video 1>). CF Image Bin refs are <Picture 1> onward. images and image_list are extra "
-                "stills after the bin. Context stays at this widget; a connected clip makes kv_capacity "
-                "auto match context. The native process exits before the next node runs."
+                "sent whole; refs, image_list and images are stills after the clip. "
+                "Thinking and speculation on this node override Settings. The native "
+                "process exits before the next node runs."
             ),
             is_input_list=True,
             inputs=[
                 ninfer_model_input(),
                 io.String.Input("prompt", default="", multiline=True, dynamic_prompts=True),
-                io.String.Input("system_prompt", default=_SYSTEM_PROMPT, multiline=True, advanced=True,
-                                tooltip="Instructions for the model. Edit or clear it. Leave empty for no system message."),
+                io.String.Input("system_prompt", default="", multiline=True, advanced=True,
+                                tooltip="Instructions for the model. Empty means no system message. Nothing is added behind your back."),
                 io.Video.Input(
                     "video", optional=True,
                     tooltip=(
-                        "Optional VIDEO. Sent as a native video_url (<Video 1>). "
-                        "A long plate is sampled across its full length instead of rejected. "
+                        "Optional VIDEO. Sent whole as a native video_url; the loader owns "
+                        "trimming (every input is start-0 full input). "
                         "Leave unconnected for stills or text."
                     ),
                 ),
                 io.Float.Input(
-                    "start_at_timestamp", default=0.0, min=0.0, step=0.1, optional=True, advanced=True,
-                    tooltip="Seconds to skip before the clip. 0 keeps the start. Ignored when video is not connected.",
-                ),
-                io.Float.Input(
-                    "duration_seconds", default=0.0, min=0.0, step=0.1, optional=True, advanced=True,
-                    tooltip="Clip length after the start offset. 0 = full input. Ignored when video is not connected.",
+                    "video_duration", default=0.0, min=0.0, step=0.1, optional=True, advanced=True,
+                    tooltip=(
+                        "True plate length in seconds. 0 probes the VIDEO file. Wire your loader's "
+                        "duration / duration_float here when container metadata is unreliable. "
+                        "This never cuts the clip; it drives vision-token planning. Ignored when video is not connected."
+                    ),
                 ),
                 io.Int.Input(
                     "video_max_side", default=0, min=0, max=2048, optional=True, advanced=True,
                     tooltip=(
-                        "Downscale the clip's longest edge (even dimensions). full mode: 0 = 512 (about 2.2k vision "
-                        "tokens for 15 s at 16:9); shrunk automatically to fit context_length/3. sampled mode: 0 = no resize."
+                        "Downscale the clip's longest edge (even dimensions). 0 = 512 (about 2.2k vision "
+                        "tokens for 15 s at 16:9); shrunk automatically to fit context_length/3."
                     ),
-                ),
-                io.Combo.Input(
-                    "video_mode", options=list(VIDEO_MODES), default="full", optional=True, advanced=True,
-                    tooltip=(
-                        "full: send the whole clip (every frame, real fps) as one video_url; ninfer samples it itself "
-                        "at video_fps (default 2, ~30 frames for 15 s) with true timestamps, and stills keep their full budget. "
-                        "sampled (legacy): thin to at most 16 - stills frames before sending (old behaviour)."
-                    ),
-                ),
-                io.Combo.Input(
-                    "video_fps", options=list(VIDEO_FPS_CHOICES), default="2", optional=True, advanced=True,
-                    tooltip=(
-                        "Ninfer sample rate for a connected clip. 2 is the trained default and the cheap path. "
-                        "3–6 decode more frames and cost vision tokens plus VRAM. 5 and 6 are for short plates "
-                        "(under 10 s, side left at 512). Needs a ninfer build that advertises --video-fps."
-                    ),
-                ),
-                io.Float.Input(
-                    "video_max_seconds", default=VIDEO_FULL_MAX_SECONDS, min=0.0, max=600.0, step=0.5, optional=True, advanced=True,
-                    tooltip="full mode: cap the clip length sent (after start_at_timestamp). 0 = no cap (ninfer allows up to 600 s / 768 sampled frames).",
                 ),
                 io.Int.Input("max_tokens", default=4096, min=1, max=1048576, tooltip="Maximum generated tokens, including thinking when enabled."),
                 io.Int.Input(
@@ -681,13 +648,32 @@ class Ninferencing(io.ComfyNode):
                     "image_max_side", default=0, min=0, max=32768,
                     tooltip="Downscale stills and image_list frames. 0 uses the largest side this frame count allows. Native video uses video_max_side.",
                 ),
+                io.Combo.Input(
+                    "thinking", options=list(THINKING_OPTIONS), default="off", optional=True, advanced=True,
+                    tooltip="Overrides Settings. off disables thinking, explicit efforts require runtime/model support.",
+                ),
+                io.Int.Input(
+                    "thinking_budget", default=0, min=0, max=65536, step=256, optional=True, advanced=True,
+                    tooltip="Overrides Settings. Cap model-origin thinking tokens (engine --thinking-budget). 0 leaves it unset. Ignored for Gemma 4.",
+                ),
+                io.Combo.Input(
+                    "reasoning_loop", options=list(REASONING_LOOP_OPTIONS), default="off", optional=True, advanced=True,
+                    tooltip="Overrides Settings. Engine --reasoning-loop: every 512 thinking tokens, test for repetition. off leaves it unset.",
+                ),
+                io.DynamicCombo.Input("speculation", options=[
+                    io.DynamicCombo.Option("off", []),
+                    *[io.DynamicCombo.Option(mode, [
+                        io.Int.Input("draft_tokens", default=3, min=1, max=15),
+                        io.Boolean.Input("lm_head_draft", default=False),
+                    ]) for mode in SPECULATION_MODES],
+                ], optional=True, tooltip="Overrides Settings. Opt in only if your model contains the required draft weights (engine range 1..15)."),
                 SettingsType.Input("settings", optional=True),
                 refs_input(),
                 io.Image.Input(
                     "image_list", optional=True, advanced=True,
                     tooltip=(
                         "Backup IMAGE batch or image list (OUTPUT_IS_LIST). Continues after CF Image Bin refs. "
-                        "Do not also wire the bin's image_list or Picture numbers repeat."
+                        "Do not also wire the bin's image_list."
                     ),
                 ),
                 io.Autogrow.Input(
@@ -698,7 +684,10 @@ class Ninferencing(io.ComfyNode):
                     tooltip="Backup stills after CF Image Bin refs, in socket order. Do not also wire the bin's image_list.",
                 ),
             ],
-            outputs=[io.String.Output(display_name="text")],
+            outputs=[
+                io.String.Output(display_name="text"),
+                io.String.Output(display_name="thinking"),
+            ],
         )
 
     @classmethod
@@ -710,39 +699,36 @@ class Ninferencing(io.ComfyNode):
             executable = resolve_executable("")
             stat = executable.stat()
             signature += (str(executable), stat.st_size, stat.st_mtime_ns)
+        for key in ("thinking", "thinking_budget", "reasoning_loop", "speculation"):
+            value = kwargs.get(key)
+            if value is not None:
+                try:
+                    node_value = first(value)
+                    if isinstance(node_value, dict):
+                        node_value = first(scalar_group(node_value))
+                    signature += (key, str(node_value))
+                except Exception:
+                    signature += (key, str(value))
         return signature
 
     @classmethod
     def execute(
         cls, model, prompt, system_prompt, max_tokens, context_length, image_max_side,
         settings=None, images=None, image_list=None, refs=None,
-        video=None, start_at_timestamp=0.0, duration_seconds=0.0, video_max_side=0,
-        video_mode="full", video_max_seconds=VIDEO_FULL_MAX_SECONDS, video_fps="2", **kwargs,
+        video=None, video_duration=0.0, video_max_side=0,
+        thinking="off", thinking_budget=0, reasoning_loop="off",
+        speculation="off", **kwargs,
     ):
-        text = run_ninfer(
+        text, thinking = run_ninfer(
             model=model, prompt=prompt, system_prompt=system_prompt,
             max_tokens=max_tokens, context_length=context_length, image_max_side=image_max_side,
             settings=settings, images=images, image_list=image_list, refs=refs,
-            video=video, start_at_timestamp=start_at_timestamp, duration_seconds=duration_seconds,
-            video_max_side=video_max_side, video_mode=video_mode, video_max_seconds=video_max_seconds,
-            video_fps=video_fps,
+            video=video, video_duration=video_duration,
+            video_max_side=video_max_side,
+            thinking=thinking, thinking_budget=thinking_budget,
+            reasoning_loop=reasoning_loop, speculation=speculation,
         )
-        return io.NodeOutput(text)
-
-
-def run_video_ninfer(
-    *, model, video, prompt, system_prompt, start_at_timestamp, duration_seconds,
-    max_tokens, context_length, image_max_side, settings=None, images=None, image_list=None,
-    refs=None, video_max_side=0,
-):
-    """Analysis-node entry. Same path as Ninferencing with a required clip."""
-    return run_ninfer(
-        model=model, prompt=prompt, system_prompt=system_prompt,
-        max_tokens=max_tokens, context_length=context_length, image_max_side=image_max_side,
-        settings=settings, images=images, image_list=image_list, refs=refs,
-        video=video, start_at_timestamp=start_at_timestamp, duration_seconds=duration_seconds,
-        video_max_side=video_max_side, has_video=True,
-    )
+        return io.NodeOutput(text, thinking)
 
 
 class NinferencingSettings(io.ComfyNode):
@@ -755,7 +741,7 @@ class NinferencingSettings(io.ComfyNode):
                 io.String.Input("executable", default=default_executable(), tooltip="Path to ninfer, or its installation directory. Uses NINFER_EXECUTABLE / NINFER_HOME / PATH when blank."),
                 io.Int.Input("device", default=-1, min=-1, max=255, tooltip="-1 uses ComfyUI's device. Other values are CUDA indices within the inherited CUDA_VISIBLE_DEVICES mapping."),
                 io.Int.Input("seed", default=0, min=0, max=0xFFFFFFFF, control_after_generate=io.ControlAfterGenerate.fixed, tooltip="Manual sampling seed. It stays fixed after generation and defaults to 0."),
-                io.Combo.Input("kv_cache", options=["auto", "bf16", "int8", "rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8"], default="auto", tooltip="Auto uses INT8 if advertised by the build; otherwise its native default. Prefer int8 on 24 GB cards. ninfer-all also advertises rk4v4 / rk4v4-e8 / rk2v4-e8."),
+                io.Combo.Input("kv_cache", options=["auto", "bf16", "int8", "fp8", "k8v4", "nvfp4", "rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8"], default="auto", tooltip="Auto: INT8 for Qwen/Bonsai, rk4v4 for Qwen3.6-35B-A3B, rk8v4 for Gemma 4 A4B when the build advertises it (3090 recommendation). Prefer int8 on 24 GB for Qwen; rk8v4 for Gemma. fp8 / k8v4 / nvfp4 are smaller KV types some builds advertise for large contexts."),
                 io.Combo.Input(
                     "kv_capacity",
                     options=["auto", "match_context", "4096", "8192", "12288", "16384", "32768"],
@@ -769,15 +755,18 @@ class NinferencingSettings(io.ComfyNode):
                         "image retries step through 16K→12K→8K explicit KV rather than slamming to 8K first."
                     ),
                 ),
+                io.Int.Input("prefill_chunk", default=1024, min=128, max=16384, step=128, advanced=True, tooltip="--prefill-chunk in tokens: larger chunks speed up prefill (must be a multiple of 128). 1024 is the engine default; 2048+ pairs with --prefill-cublas for long vision prompts."),
                 io.Combo.Input("cuda_graphs", options=["auto", "on", "off"], default="auto", tooltip="Auto disables capture when the build supports it to reduce memory pressure. On uses the runtime default."),
                 io.Combo.Input("thinking", options=["auto", "model default", "off", "low", "medium", "high", "xhigh"], default="auto", tooltip="Auto disables thinking when supported. Explicit efforts require support from your runtime and model."),
+                io.Int.Input("thinking_budget", default=0, min=0, max=65536, step=256, advanced=True, tooltip="Cap model-origin thinking tokens (engine --thinking-budget; inserted control tokens count toward --max-new). 0 leaves it unset. Ignored for Gemma 4 (no early-close control)."),
+                io.Combo.Input("reasoning_loop", options=["off", "stop", "conclude"], default="off", advanced=True, tooltip="Engine --reasoning-loop: every 512 thinking tokens, test whether thinking repeats whole passages. stop ends the reply, conclude closes thinking and lets the model answer. off leaves it unset."),
                 io.DynamicCombo.Input("speculation", options=[
                     io.DynamicCombo.Option("off", []),
                     *[io.DynamicCombo.Option(mode, [
-                        io.Int.Input("draft_tokens", default=3, min=1, max=256),
+                        io.Int.Input("draft_tokens", default=3, min=1, max=15),
                         io.Boolean.Input("lm_head_draft", default=False),
                     ]) for mode in ("mtp", "dflash", "dflash2")],
-                ], tooltip="Opt in only if your model contains the required draft weights. dflash2 needs the ninfer-all CLI and a Bonsai/v3 artifact with the adapter."),
+                ], tooltip="Opt in only if your model contains the required draft weights (engine range 1..15). Gemma 4 uses MTP (engine default when off and the artifact has the drafter); dflash/dflash2 are remapped to MTP for Gemma. dflash2 needs the ninfer-all CLI and a Bonsai/v3 artifact with the adapter."),
                 io.DynamicCombo.Input("sampling", options=[
                     io.DynamicCombo.Option("custom", [
                         io.Float.Input(

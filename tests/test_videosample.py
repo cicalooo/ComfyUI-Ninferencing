@@ -1,4 +1,4 @@
-"""Streamed sampling: frame budget, size cap, and plate-length preservation."""
+"""Full-clip only: size cap, wall-clock preservation, and vision planning."""
 
 from fractions import Fraction
 from pathlib import Path
@@ -52,52 +52,36 @@ def test_probe_refuses_non_video_input(tmp_path):
     assert probe_video(text) is None
 
 
-def test_clip_inside_the_budget_is_not_reencoded(tmp_path):
+def test_clip_without_size_cap_is_not_reencoded(tmp_path):
     source = _write_clip(tmp_path / "short.mp4", frames=8, fps=24)
     info = probe_video(source)
-    # 8 frames within a 16-frame budget and no size cap → send the file as-is.
-    assert build_clip(info, tmp_path / "out.mp4", max_frames=16, max_side=0) is None
+    # No size cap → send the file as-is, however many frames it holds.
+    assert build_clip(info, tmp_path / "out.mp4", max_side=0) is None
 
 
-def test_long_plate_is_thinned_and_keeps_its_wall_clock_length(tmp_path):
+def test_full_clip_keeps_every_frame_and_its_wall_clock_length(tmp_path):
     source = _write_clip(tmp_path / "plate.mp4", frames=192, fps=24)  # 8 s
     info = probe_video(source)
-    out = build_clip(info, tmp_path / "sampled.mp4", max_frames=16, max_side=0)
+    out = build_clip(info, tmp_path / "full.mp4", max_side=0)
+    # 128x96 is already under a 0 cap (no resize) → None; force a resize
+    # instead to exercise the full re-encode path.
+    assert out is None
+    out = sample_video(info, tmp_path / "full.mp4")
     assert out is not None
     frames, duration, size = _measure(out)
-    assert frames == 16
-    # The analysis timeline must still map 1:1 onto the plate: 8 s in, 8 s out.
-    assert duration == pytest.approx(8.0, abs=0.1)
+    assert frames == 192
+    assert duration == pytest.approx(8.0, abs=0.2)
     assert size == (128, 96)
-
-
-def test_sampling_spreads_over_the_whole_clip(tmp_path):
-    source = _write_clip(tmp_path / "plate.mp4", frames=40, fps=24)
-    info = probe_video(source)
-    out = build_clip(info, tmp_path / "sampled.mp4", max_frames=15, max_side=0)
-    frames, duration, _ = _measure(out)
-    assert frames == 15
-    assert duration == pytest.approx(40 / 24, abs=0.1)
 
 
 def test_size_cap_resizes_during_decode(tmp_path):
     source = _write_clip(tmp_path / "hd.mp4", frames=4, fps=24, width=1920, height=1080)
     info = probe_video(source)
-    out = build_clip(info, tmp_path / "small.mp4", max_frames=16, max_side=640)
+    out = build_clip(info, tmp_path / "small.mp4", max_side=640)
     frames, duration, size = _measure(out)
     assert frames == 4
     assert size == (640, 360)  # down-only, even, 16:9 kept
     assert duration == pytest.approx(4 / 24, abs=0.1)
-
-
-def test_sample_and_resize_together(tmp_path):
-    source = _write_clip(tmp_path / "plate.mp4", frames=48, fps=24, width=1920, height=1080)
-    info = probe_video(source)
-    out = build_clip(info, tmp_path / "both.mp4", max_frames=8, max_side=512)
-    frames, duration, size = _measure(out)
-    assert frames == 8
-    assert size == (512, 288)
-    assert duration == pytest.approx(48 / 24, abs=0.1)
 
 
 def test_lock_size_never_upscales():
@@ -106,18 +90,12 @@ def test_lock_size_never_upscales():
     assert lock_size(128, 96, 0, 2) == (128, 96)
 
 
-def test_empty_keep_set_returns_none(tmp_path):
-    source = _write_clip(tmp_path / "source.mp4", frames=4, fps=24)
-    info = probe_video(source)
-    assert sample_video(info, tmp_path / "never.mp4", keep=[]) is None
-    assert not (tmp_path / "never.mp4").exists()
-
-
-def test_ninfer_video_plan_scales_sample_count_with_fps():
-    frames_2, *_ = videosample.ninfer_video_plan(512, 288, 192, 24, fps=2)
-    frames_6, *_ = videosample.ninfer_video_plan(512, 288, 192, 24, fps=6)
-    assert frames_2 == 16
-    assert frames_6 == 48
+def test_ninfer_video_plan_samples_at_the_baked_2fps():
+    # Ninfer always samples native video at 2 fps; there is no per-request flag.
+    frames, _, _, tokens, stamps = videosample.ninfer_video_plan(512, 288, 192, 24)
+    assert frames == 16
+    assert videosample.NINFER_VIDEO_FPS == 2.0
+    assert tokens > 0 and len(stamps) == frames // 2
 
 
 def test_samplers_share_the_nodes_entry_point():

@@ -28,18 +28,18 @@ HELP = """ninfer model.ninfer --messages FILE --max-new N --seed N
 """
 FLAGS = set(re.findall(r"--[\w-]+", HELP))
 HELP_ALL = HELP + """
---kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8
+--kv-dtype bf16|int8|fp8|k8v4|nvfp4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8
+--thinking-budget N --reasoning-loop off|stop|conclude
 --spec mtp|dflash|dflash2 --gdn-state-fp16
---vision-residency resident|overlay|cpu --vision-max-merged N --video-fps N
+--vision-residency resident|overlay|cpu --vision-max-merged N
 """
 FLAGS_ALL = set(re.findall(r"--[\w-]+", HELP_ALL))
 
 
-def command(settings=runtime.Settings(), flags=FLAGS, help_text=HELP, images=False, video=False, video_fps=2):
+def command(settings=runtime.Settings(), flags=FLAGS, help_text=HELP, images=False, video=False):
     return runtime.build_command(
         Path("/runtime/ninfer"), Path("/models/any-family.ninfer"), Path("/temp/messages.json"),
         settings, flags, help_text, max_tokens=512, seed=123, device=0, has_images=images, has_video=video,
-        video_fps=video_fps,
     )
 
 
@@ -58,6 +58,53 @@ def test_default_command_is_model_neutral_and_explicit_about_memory():
     assert argv[argv.index("--min-p") + 1] == "0.0"
     assert argv[argv.index("--presence-penalty") + 1] == "1.5"
     assert argv[argv.index("--frequency-penalty") + 1] == "0.0"
+    assert argv[argv.index("--prefill-chunk") + 1] == "1024"
+    assert "--thinking-budget" not in argv and "--reasoning-loop" not in argv
+
+
+def test_prefill_chunk_is_configurable_and_extra_args_wins():
+    settings = replace(runtime.Settings(), prefill_chunk=2048)
+    argv = command(settings)
+    assert argv[argv.index("--prefill-chunk") + 1] == "2048"
+    with pytest.raises(ValueError, match="multiple of 128"):
+        command(replace(runtime.Settings(), prefill_chunk=100))
+    settings = replace(runtime.Settings(), extra_args='["--prefill-chunk", "4096"]')
+    argv = command(settings)
+    assert argv.count("--prefill-chunk") == 1
+    assert argv[argv.index("--prefill-chunk") + 1] == "4096"
+
+
+def test_thinking_budget_and_reasoning_loop_are_opt_in():
+    settings = replace(runtime.Settings(), thinking_budget=512, reasoning_loop="conclude")
+    argv = command(settings, flags=FLAGS_ALL, help_text=HELP_ALL)
+    assert argv[argv.index("--thinking-budget") + 1] == "512"
+    assert argv[argv.index("--reasoning-loop") + 1] == "conclude"
+    with pytest.raises(ValueError, match="reasoning_loop"):
+        command(replace(runtime.Settings(), reasoning_loop="sometimes"))
+
+
+def test_draft_tokens_follow_the_engine_limit():
+    schema = nodes.NinferencingSettings.define_schema()
+    speculation = next(item for item in schema.inputs if item.id == "speculation")
+    for option in speculation.options:
+        for widget in option.inputs:
+            if widget.id == "draft_tokens":
+                assert (widget.min, widget.max) == (1, 15)
+    with pytest.raises(ValueError, match="1\\.\\.15"):
+        command(replace(runtime.Settings(),
+                        speculation={"speculation": "mtp", "draft_tokens": 16, "lm_head_draft": False}))
+    argv = command(replace(runtime.Settings(),
+                           speculation={"speculation": "mtp", "draft_tokens": 15, "lm_head_draft": False}))
+    assert argv[argv.index("--draft-tokens") + 1] == "15"
+
+
+def test_kv_cache_offers_the_small_context_types():
+    schema = nodes.NinferencingSettings.define_schema()
+    kv_cache = next(item for item in schema.inputs if item.id == "kv_cache")
+    for dtype in ("auto", "bf16", "int8", "fp8", "k8v4", "nvfp4"):
+        assert dtype in kv_cache.options
+    argv = command(replace(runtime.Settings(), kv_cache="fp8"), flags=FLAGS_ALL, help_text=HELP_ALL)
+    assert argv[argv.index("--kv-dtype") + 1] == "fp8"
 
 
 def test_still_image_vision_keeps_auto_kv_capacity():
@@ -89,12 +136,43 @@ def test_video_is_optional_and_context_stays_put():
     schema = nodes.Ninferencing.define_schema()
     inputs = {item.id: item for item in schema.inputs}
     assert inputs["video"].optional
-    assert inputs["context_length"].default == 32768
+    assert inputs["video_duration"].optional and inputs["video_duration"].default == 0.0
     assert inputs["video_max_side"].optional and inputs["video_max_side"].advanced
-    assert "seconds" not in inputs
-    assert [item.display_name for item in schema.outputs] == ["text"]
+    for removed in ("start_at_timestamp", "duration_seconds", "video_fps", "video_max_seconds", "video_mode"):
+        assert removed not in inputs
+    assert [item.display_name for item in schema.outputs] == ["text", "thinking"]
     settings_inputs = {item.id: item for item in nodes.NinferencingSettings.define_schema().inputs}
     assert settings_inputs["kv_capacity"].default == "auto"
+    assert inputs["system_prompt"].default == ""
+    assert inputs["thinking"].default == "off"
+    assert inputs["reasoning_loop"].default == "off"
+    assert inputs["thinking_budget"].default == 0
+    speculation = next(item for item in schema.inputs if item.id == "speculation")
+    assert speculation.options[0].key == "off"
+
+
+def test_main_thinking_and_speculation_override_settings(tmp_path):
+    assert nodes.THINKING_OPTIONS[0] == "off"
+    assert nodes.REASONING_LOOP_OPTIONS == ("off", "stop", "conclude")
+    assert nodes.SPECULATION_MODES == ("mtp", "dflash", "dflash2")
+    base = runtime.Settings()
+    assert nodes._override_thinking(base, thinking=["off"]).thinking == "off"
+    assert nodes._override_thinking(base, thinking=["low"]).thinking == "low"
+    assert nodes._override_thinking(base, thinking_budget=[512]).thinking_budget == 512
+    assert nodes._override_thinking(base, reasoning_loop=["conclude"]).reasoning_loop == "conclude"
+    assert nodes._override_speculation(
+        base, {"speculation": ["mtp"], "draft_tokens": [5], "lm_head_draft": [True]},
+    ).speculation == {"speculation": "mtp", "draft_tokens": 5, "lm_head_draft": True}
+    assert nodes._override_speculation(base, {"speculation": ["off"]}).speculation == {"speculation": "off"}
+    assert nodes._override_speculation(base, "off").speculation == {"speculation": "off"}
+    # Main fingerprint covers the overrides so toggle changes invalidate the cache.
+    artifact = tmp_path / "model.ninfer"
+    artifact.touch()
+    selection = {"model": "file path", "path": str(artifact)}
+    plain = nodes.Ninferencing.fingerprint_inputs(selection, thinking=["off"])
+    assert nodes.Ninferencing.fingerprint_inputs(selection, thinking=["low"]) != plain
+    assert nodes.Ninferencing.fingerprint_inputs(
+        selection, speculation={"speculation": ["mtp"], "draft_tokens": [5]}) != plain
 
 
 def test_automatic_options_adapt_to_older_build():
@@ -381,32 +459,21 @@ def test_unload_comfy_survives_shrinking_registry(monkeypatch):
 
 
 class FakeVideo:
-    """Minimal VIDEO stand-in for export_video_path call-arg checks."""
+    """Minimal VIDEO stand-in: the loader owns trimming, export is full-input only."""
 
-    def __init__(self, source=None, duration=10.0):
+    def __init__(self, source=None, trim=(0.0, 0.0)):
         self._source = source
-        self._duration = duration
-        self.as_trimmed_calls = []
+        self._trim = trim
         self.save_calls = []
 
     def get_stream_source(self):
         return self._source
 
     def get_duration(self):
-        return self._duration
+        return 10.0
 
     def get_active_trim_window(self):
-        return (0.0, 0.0)
-
-    def as_trimmed(self, start_time=None, duration=None, strict_duration=True):
-        self.as_trimmed_calls.append({"start_time": start_time, "duration": duration})
-        # Mirror VideoFromComponents: None + float must not be reachable after the fix.
-        if start_time is None or duration is None:
-            raise TypeError("unsupported operand type(s) for +: 'NoneType' and 'float'")
-        if self._duration < start_time + duration and duration > 0.0:
-            return None
-        trimmed = FakeVideo(self._source, duration=duration or (self._duration - start_time))
-        return trimmed
+        return self._trim
 
     def save_to(self, path, format=None, codec=None):
         self.save_calls.append(path)
@@ -418,94 +485,34 @@ def test_export_video_path_reuses_on_disk_when_untrimmed(tmp_path):
     source.write_bytes(b"on-disk")
     video = FakeVideo(str(source))
     assert nodes.export_video_path(video, tmp_path) == source
-    assert video.as_trimmed_calls == []
     assert video.save_calls == []
 
 
-def test_export_video_path_passes_float_start_when_only_duration_set(tmp_path):
-    # Regression: start_at_timestamp=0 used to pass start_time=None while duration
-    # was a float; as_trimmed then did start_time + duration and TypeErrored.
-    video = FakeVideo(str(tmp_path / "missing.mp4"))
-    path = nodes.export_video_path(video, tmp_path, start_seconds=0.0, duration_seconds=3.5)
+def test_export_video_path_reencodes_without_on_disk_source(tmp_path):
+    video = FakeVideo()
+    path = nodes.export_video_path(video, tmp_path)
     assert path == tmp_path / "input_video.mp4"
-    assert video.as_trimmed_calls == [{"start_time": 0.0, "duration": 3.5}]
+    assert video.save_calls == [str(path)]
     assert path.is_file()
 
 
-def test_export_video_path_passes_float_duration_when_only_start_set(tmp_path):
-    video = FakeVideo(str(tmp_path / "missing.mp4"))
-    path = nodes.export_video_path(video, tmp_path, start_seconds=1.25, duration_seconds=0.0)
-    assert path == tmp_path / "input_video.mp4"
-    assert video.as_trimmed_calls == [{"start_time": 1.25, "duration": 0.0}]
-
-
-def test_export_video_path_clamps_duration_past_eof_to_full_clip(tmp_path):
-    """Requesting longer than the source clamps to the full clip and skips trim."""
-    source = tmp_path / "short.mp4"
-    source.write_bytes(b"short-plate")
-    video = FakeVideo(str(source), duration=2.0)
-    assert nodes.export_video_path(video, tmp_path, start_seconds=0.0, duration_seconds=5.0) == source
-    assert video.as_trimmed_calls == []
-    assert video.save_calls == []
-
-
-def test_export_video_path_past_eof_start_raises_with_diagnostics(tmp_path):
-    video = FakeVideo(duration=2.0)
-    with pytest.raises(ValueError, match=r"past end of clip.*source_duration=2.*start=5"):
-        nodes.export_video_path(video, tmp_path, start_seconds=5.0, duration_seconds=3.0)
-    assert video.as_trimmed_calls == []
-
-
-def test_export_video_path_clamps_partial_window(tmp_path):
-    """start in range + duration past EOF → clamp length, still call as_trimmed."""
-    video = FakeVideo(duration=2.0)
-    path = nodes.export_video_path(video, tmp_path, start_seconds=1.5, duration_seconds=5.0)
-    assert path == tmp_path / "input_video.mp4"
-    assert video.as_trimmed_calls == [{"start_time": 1.5, "duration": 0.5}]
-    assert path.is_file()
-
-
-def test_export_video_path_double_trim_safe_when_duration_matches_prep(tmp_path):
-    """Prep already output an 8s (or slightly short) plate; Video asks for 8s again.
-
-    After clamp the window equals the full input, so we skip as_trimmed and reuse
-    the on-disk path (avoids VideoFromFile strict_duration → None).
-    """
-    source = tmp_path / "prep_plate.mp4"
-    source.write_bytes(b"prep-8s")
-    video = FakeVideo(str(source), duration=7.958333)  # 191 frames @ 24 fps
-    assert nodes.export_video_path(video, tmp_path, start_seconds=0.0, duration_seconds=8.0) == source
-    assert video.as_trimmed_calls == []
-
-
-
-def test_export_video_path_does_not_reuse_file_with_pending_trim(tmp_path):
-    """VideoFromFile-style: on-disk bytes are the full source; trim is metadata.
-
-    After clamp the window equals the *presented* duration, but reusing the
-    path would send the untrimmed file to ninfer. Must re-encode.
-    """
+def test_export_video_path_reencodes_with_pending_trim(tmp_path):
+    """Unbaked trim metadata: the file bytes are not the presented clip."""
     source = tmp_path / "full_source.mp4"
     source.write_bytes(b"longer-than-presented")
-    video = FakeVideo(str(source), duration=8.0)
-    video.get_active_trim_window = lambda: (0.0, 8.0)
-    path = nodes.export_video_path(video, tmp_path, start_seconds=0.0, duration_seconds=8.0)
+    video = FakeVideo(str(source), trim=(0.0, 8.0))
+    path = nodes.export_video_path(video, tmp_path)
     assert path == tmp_path / "input_video.mp4"
-    assert video.as_trimmed_calls == []
     assert video.save_calls == [str(path)]
     assert path.read_bytes() == b"exported"
 
 
-def test_export_video_path_duration_zero_default_skips_trim(tmp_path):
-    """Workflow default: duration_seconds=0 on already-Prep'd VIDEO → full input."""
-    source = tmp_path / "prep_plate.mp4"
-    source.write_bytes(b"prep-full")
-    video = FakeVideo(str(source), duration=8.0)
-    assert nodes.export_video_path(video, tmp_path, start_seconds=0.0, duration_seconds=0.0) == source
-    assert video.as_trimmed_calls == []
+def test_export_video_path_rejects_missing_video(tmp_path):
+    with pytest.raises(ValueError, match="connect a VIDEO input"):
+        nodes.export_video_path(None, tmp_path)
 
 
-def test_long_plate_is_sampled_across_its_length_to_fit_the_vision_budget(tmp_path):
+def test_full_clip_is_sent_whole_with_planned_tokens(tmp_path):
     import av
     from fractions import Fraction
 
@@ -515,13 +522,14 @@ def test_long_plate_is_sampled_across_its_length_to_fit_the_vision_budget(tmp_pa
     images = torch.zeros(count, 32, 48, 3)
     images[:, 0, 0, 0] = torch.arange(count)
     video = VideoFromComponents(VideoComponents(images=images, audio=None, frame_rate=Fraction(24, 1)))
-    path = nodes.fit_video_for_vision(video, tmp_path, max_frames=15)
+    path, video_tokens = nodes.fit_video_for_vision(video, tmp_path, video_max_side=0)
+    assert video_tokens >= 0
     container = av.open(str(path))
     try:
         decoded = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
     finally:
         container.close()
-    assert len(decoded) == 15
+    assert len(decoded) == count
     assert nodes.spread_indices(count, 15)[0] == 0
     assert nodes.spread_indices(count, 15)[-1] == count - 1
 
@@ -567,7 +575,7 @@ def test_images_preserve_dimensions_and_include_every_batch_item(tmp_path):
 
 
 def test_image_list_socket_accepts_video_batch_and_output_is_list(tmp_path):
-    # H3J Video Frames style: one IMAGE batch. H3J Image Bin style: OUTPUT_IS_LIST.
+    # Video-frames style: one IMAGE batch. Image-bin style: OUTPUT_IS_LIST.
     sources = {
         "image_list": [torch.zeros(3, 40, 30, 3), torch.ones(1, 20, 10, 3)],
         "image0": torch.full((1, 8, 8, 3), 0.5),
@@ -579,7 +587,7 @@ def test_image_list_socket_accepts_video_batch_and_output_is_list(tmp_path):
     assert schema_inputs["image_list"].optional
 
 
-def test_refs_cable_is_picture_order_and_separate_images(tmp_path):
+def test_refs_cable_preserves_order_and_separate_images(tmp_path):
     red = torch.zeros(1, 8, 6, 3)
     red[..., 0] = 1
     green = torch.zeros(1, 5, 9, 3)
@@ -632,6 +640,48 @@ def test_refs_over_vision_budget_are_not_thinned(tmp_path):
     sources = nodes.collect_image_sources(refs=refs)
     with pytest.raises(ValueError, match="not thinned"):
         nodes.write_messages(tmp_path, "", "", sources, 0, 32768)
+
+
+def test_video_token_reserve_shrinks_stills_and_prefetch_overflow_raises(tmp_path):
+    # 6 large stills alone fit 8192; reserving a 15 s plate (~2.2k tokens) must
+    # shrink them instead of overflowing like the old image-as-video 8192 failure.
+    sources = {"image_list": [torch.zeros(1, 1600, 1600, 3) for _ in range(6)]}
+    plain, _ = nodes.write_messages(tmp_path, "", "", sources, 0, 8192)
+    reserved_dir = tmp_path / "reserved"
+    reserved_dir.mkdir()
+    reserved, _ = nodes.write_messages(reserved_dir, "", "", sources, 0, 8192, video_token_reserve=2160)
+    sizes = []
+    for path in (plain, reserved):
+        content = json.loads(path.read_text())[0]["content"]
+        with Image.open(content[0]["image_url"]["url"]) as image:
+            sizes.append(max(image.size))
+    assert sizes[1] < sizes[0]
+    with pytest.raises(ValueError, match="planned prompt exceeds context_length"):
+        nodes.write_messages(tmp_path, "", "", sources, 0, 2048, video_token_reserve=2160)
+
+
+def test_fit_video_for_vision_returns_tokens_and_honors_duration_override(tmp_path):
+    import av
+    from fractions import Fraction
+
+    import numpy as np
+
+    container = av.open(str(tmp_path / "plate.mp4"), mode="w")
+    stream = container.add_stream("libx264", rate=Fraction(24, 1))
+    stream.width, stream.height, stream.pix_fmt = 128, 96, "yuv420p"
+    for _ in range(48):
+        frame = av.VideoFrame.from_ndarray(np.zeros((96, 128, 3), dtype=np.uint8), format="rgb24")
+        container.mux(stream.encode(frame))
+    container.mux(stream.encode())
+    container.close()
+
+    from comfy_api.latest import VideoFromFile
+
+    video = VideoFromFile(str(tmp_path / "plate.mp4"))
+    path, tokens = nodes.fit_video_for_vision(video, tmp_path, video_max_side=512)
+    assert Path(path).is_file() and tokens > 0
+    _, claimed_tokens = nodes.fit_video_for_vision(video, tmp_path, video_max_side=512, video_duration=2.0)
+    assert claimed_tokens == tokens
 
 
 def test_image_resize_is_only_opt_in(tmp_path):
@@ -734,13 +784,12 @@ def test_capacity_failure_without_tighten_keeps_same_command(monkeypatch):
     assert len(calls) == 2 and calls[0] == calls[1] == argv
 
 
-def test_video_fps_omitted_at_default_and_passed_when_raised():
-    defaulted = command(flags=FLAGS_ALL, help_text=HELP_ALL, video=True)
-    assert "--video-fps" not in defaulted
-    raised = command(flags=FLAGS_ALL, help_text=HELP_ALL, video=True, video_fps=6)
-    assert raised[raised.index("--video-fps") + 1] == "6"
-    with pytest.raises(ValueError, match="does not advertise --video-fps"):
-        command(flags=FLAGS, help_text=HELP, video=True, video_fps=6)
+def test_baked_2fps_is_never_passed_to_the_cli():
+    from Ninferencing import videosample
+
+    assert videosample.NINFER_VIDEO_FPS == 2.0
+    assert "--video-fps" not in command(flags=FLAGS_ALL, help_text=HELP_ALL, video=True)
+    assert "--video-fps" not in command(flags=FLAGS_ALL, help_text=HELP_ALL, images=True, video=True)
 
 
 def test_ninfer_all_adds_gdn_and_vision_overlay():
@@ -1013,12 +1062,14 @@ def test_comfy_execution_expands_settings_and_aggregates_image_lists(tmp_path, m
     inputs, missing, v3_data = comfy_execution.get_input_data({
         "model": "file path", "model.path": str(artifact), "prompt": "look", "system_prompt": "",
         "max_tokens": 123, "context_length": 8192, "image_max_side": 4,
+        "thinking": "off", "thinking_budget": 0, "reasoning_loop": "off",
+        "speculation": "mtp", "speculation.draft_tokens": 3, "speculation.lm_head_draft": True,
         "images.image0": ["image-node", 0],
         "image_list": ["video-frames", 0], "settings": ["settings", 0],
     }, nodes.Ninferencing, "generate")
     assert missing.keys() == {"settings", "images.image0", "image_list"}
     inputs["images.image0"] = [torch.zeros(2, 2, 3, 3), torch.zeros(1, 3, 4, 3)]
-    # OUTPUT_IS_LIST of single-frame tensors (e.g. H3J Image Bin image_list)
+    # OUTPUT_IS_LIST of single-frame tensors (e.g. image-bin image_list)
     inputs["image_list"] = [torch.zeros(1, 5, 5, 3), torch.ones(1, 6, 6, 3)]
     inputs["settings"] = [settings]
     calls = []
@@ -1036,13 +1087,13 @@ def test_comfy_execution_expands_settings_and_aggregates_image_lists(tmp_path, m
         assert argv[argv.index("--kv-capacity") + 1] == "auto"
         assert argv[argv.index("--temperature") + 1] == "0.4"
         calls.append(argv)
-        return "one answer for every image"
+        return "one answer for every image", "reasoning trace"
 
     monkeypatch.setattr(nodes, "generate", complete)
     results = asyncio.run(comfy_execution._async_map_node_over_list(
         "test", "generate", nodes.Ninferencing, inputs, "execute", v3_data=v3_data,
     ))
-    assert results[0].result == ("one answer for every image",)
+    assert results[0].result == ("one answer for every image", "reasoning trace")
     assert results[0].ui is None  # no on-node preview; the text goes to the output socket
     assert len(calls) == 1
     assert not list(tmp_path.glob("ninferencing-*"))
@@ -1079,6 +1130,129 @@ def test_large_diagnostics_do_not_deadlock_and_tail_is_bounded(tmp_path):
         "import sys; sys.stderr.write('x' * 1000000); print('answer')", tmp_path, timeout=10, check_cancel=lambda: None,
     )
     assert code == 0 and text.strip() == "answer" and len(tail) == 12288
+
+
+def test_full_stderr_is_available_for_the_thinking_output(tmp_path):
+    code, text, full = run_python(
+        "import sys; sys.stderr.write('thinking-trace'); print('answer')", tmp_path, timeout=10,
+        check_cancel=lambda: None, tail_limit=None,
+    )
+    assert code == 0 and text.strip() == "answer" and full == "thinking-trace"
+
+
+def test_generate_returns_answer_and_thinking_stream(monkeypatch):
+    seen = {}
+
+    def fake(*args, **kwargs):
+        seen.update(kwargs)
+        return 0, "the answer", (
+            "engine ready | qwen3.8-27b | total 48.1 s | weights 17.00 GiB | CUDA sync on\n"
+            "the reasoning trace\n"
+            "phase       detail                      elapsed/progress\n"
+            "summary     finish reason               stop-token\n"
+        )
+
+    monkeypatch.setattr(runtime, "run_process", fake)
+    text, thinking = runtime.generate(command(), 5, lambda: None, None)
+    assert text == "the answer"
+    assert thinking == "the reasoning trace"
+    # The thinking output keeps the whole stderr, not the bounded error tail.
+    assert seen.get("tail_limit") is None
+
+
+def test_extract_reasoning_strips_startup_logs_and_summary():
+    stderr = (
+        "build 7a89828a3446cd1fa7bb1465ad10386469718e05\n"
+        "starting engine\n"
+        "loading weights | 17.00 GiB\n"
+        "  loading weights [======>.....] 45% | 7.65 GiB/17.00 GiB | 390.12 MiB/s | ETA 24.5 s\n"
+        "weights ready | 17.00 GiB | 45.2 s | 390.12 MiB/s\n"
+        "engine ready | qwen3.8-27b | total 48.1 s | weights 17.00 GiB | CUDA sync on\n"
+        "First thought line.\n"
+        "engine | transfer 12.0 ms | prefill 3.1 s\n"
+        "Second thought line.\n"
+        "phase       detail                      elapsed/progress\n"
+        "prepare     render/preprocess           3.1 s\n"
+        "summary     sampling                    temp=0.70 top_p=0.80 top_k=20 min_p=0.00 presence=1.50 freq=0.00 seed=0\n"
+    )
+    assert runtime.extract_reasoning(stderr) == "First thought line.\nSecond thought line."
+
+
+def test_extract_reasoning_keeps_quoted_markup_and_strips_prefixed_lines():
+    stderr = (
+        "The </think> tag closes reasoning.\n"
+        "debug: frontend ready\n"
+        "media | swscaler: deprecated pixel format\n"
+        "warning: engine | prefix cache not restored | none\n"
+        "error: this line is a log record, not thinking\n"
+        "actual thought\n"
+    )
+    assert runtime.extract_reasoning(stderr) == (
+        "The </think> tag closes reasoning.\nactual thought"
+    )
+
+
+def test_extract_reasoning_strips_ansi_before_matching():
+    stderr = "\x1b[31m\x1b[1merror: \x1b[mkaput\nactual thought\n"
+    assert runtime.extract_reasoning(stderr) == "actual thought"
+
+
+def test_extract_reasoning_empty_without_stderr():
+    assert runtime.extract_reasoning("") == ""
+    assert runtime.extract_reasoning(None) == ""
+    assert runtime.extract_reasoning(
+        "engine ready | qwen3.8-27b | total 48.1 s | weights 17.00 GiB | CUDA sync on\n"
+        "phase       detail                      elapsed/progress\n"
+        "summary     finish reason               stop-token\n"
+    ) == ""
+
+
+def test_extract_reasoning_drops_barless_progress_and_following_startup_lines():
+    # Real Gemma4 startup tail: the bar-less persistent progress line (no `[==>]`)
+    # used to break the leading block, leaking the lines after it too.
+    stderr = (
+        "build 7a89828a3446cd1fa7bb1465ad10386469718e05\n"
+        "starting engine\n"
+        "loading weights | 16.9 GiB\n"
+        "  loading weights 97.2% | 16.4 GiB/16.9 GiB | 1.76 GiB/s | ETA 270 ms\n"
+        "weights ready | 16.9 GiB | 10.3s | 1.64 GiB/s\n"
+        "CUDA graphs ready | 519 ms\n"
+        "engine ready | xdavxd-gemma4-26B-A4B-qat-heretic-ega-MTP-sm86 | total 12.0s | weights 15.8 GiB | CUDA sync auto\n"
+        "phase       detail                      elapsed/progress\n"
+        "summary     finish reason               stop-token\n"
+    )
+    assert runtime.extract_reasoning(stderr) == ""
+
+
+def test_extract_reasoning_keeps_trace_after_barless_progress():
+    stderr = (
+        "loading weights | 16.9 GiB\n"
+        "  loading weights 97.2% | 16.4 GiB/16.9 GiB | 1.76 GiB/s | ETA 270 ms\n"
+        "weights ready | 16.9 GiB | 10.3s | 1.64 GiB/s\n"
+        "engine ready | xdavxd-gemma4-26B-A4B-qat-heretic-ega-MTP-sm86 | total 12.0s | weights 15.8 GiB | CUDA sync auto\n"
+        "Let me think through this.\n"
+        "  loading weights [======>.....] 45% | bracketed TTY form never matches prose\n"
+        "phase       detail                      elapsed/progress\n"
+        "summary     finish reason               stop-token\n"
+    )
+    assert runtime.extract_reasoning(stderr) == (
+        "Let me think through this.\n"
+        "  loading weights [======>.....] 45% | bracketed TTY form never matches prose"
+    )
+
+
+def test_node_execute_returns_text_and_thinking(tmp_path, monkeypatch):
+    artifact = tmp_path / "model.ninfer"
+    artifact.touch()
+    monkeypatch.setattr(nodes, "resolve_executable", lambda value: Path(sys.executable))
+    monkeypatch.setattr(nodes, "probe_runtime", lambda *args: (HELP, FLAGS))
+    monkeypatch.setattr(nodes, "prepare_memory", lambda *args, **kwargs: {"after_free": 9 * 1024 ** 3})
+    monkeypatch.setattr(folder_paths, "get_temp_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(nodes, "generate", lambda *args, **kwargs: ("the answer", "the trace"))
+    out = nodes.Ninferencing.execute(
+        {"model": ["file path"], "path": [str(artifact)]}, ["hello"], [""], [32], [32768], [0],
+    )
+    assert tuple(out) == ("the answer", "the trace")
 
 
 class Cancelled(BaseException):
@@ -1185,8 +1359,9 @@ def test_image_vision_capacity_retry_uses_mid_context_not_video_floor(monkeypatc
     monkeypatch.setattr(runtime, "run_process", fail_then_ok)
     argv = command(replace(runtime.Settings(), context_length=32768), images=True)
     assert "--vision" in argv and argv[argv.index("--kv-capacity") + 1] == "auto"
-    text = runtime.generate(argv, 5, lambda: None, None)
+    text, thinking = runtime.generate(argv, 5, lambda: None, None)
     assert text == "rewritten prompt"
+    assert thinking == ""
     assert len(calls) == 2
     assert calls[1][calls[1].index("--kv-capacity") + 1] == str(runtime.IMAGE_SAFE_CONTEXT)
     assert calls[1][calls[1].index("--max-context") + 1] == str(runtime.IMAGE_SAFE_CONTEXT)
@@ -1217,7 +1392,7 @@ def test_prepared_prompt_exceeds_retries_with_higher_context(monkeypatch):
     settings = replace(runtime.Settings(), context_length=runtime.VIDEO_SAFE_CONTEXT, kv_capacity="match_context")
     argv = command(settings, images=True)
     assert argv[argv.index("--max-context") + 1] == str(runtime.VIDEO_SAFE_CONTEXT)
-    text = runtime.generate(argv, 5, lambda: None, None)
+    text, _thinking = runtime.generate(argv, 5, lambda: None, None)
     assert text == "ok"
     assert len(calls) == 2
     assert calls[1][calls[1].index("--max-context") + 1] == str(runtime.IMAGE_MID_CONTEXT)
@@ -1246,7 +1421,7 @@ def test_auto_capacity_then_prompt_exceed_expands_instead_of_hard_fail(monkeypat
 
     monkeypatch.setattr(runtime, "run_process", scripted)
     argv = command(replace(runtime.Settings(), context_length=32768), images=True)
-    text = runtime.generate(argv, 5, lambda: None, None)
+    text, _thinking = runtime.generate(argv, 5, lambda: None, None)
     assert text == "done"
     assert len(calls) == 3
     assert calls[1][calls[1].index("--max-context") + 1] == str(runtime.IMAGE_SAFE_CONTEXT)
@@ -1284,6 +1459,6 @@ def test_image_auto_at_mid_context_retries_explicit_same_size(monkeypatch):
     monkeypatch.setattr(runtime, "run_process", fail_then_ok)
     argv = command(replace(runtime.Settings(), context_length=runtime.IMAGE_SAFE_CONTEXT), images=True)
     assert argv[argv.index("--kv-capacity") + 1] == "auto"
-    assert runtime.generate(argv, 5, lambda: None, None) == "ok"
+    assert runtime.generate(argv, 5, lambda: None, None) == ("ok", "")
     assert calls[1][calls[1].index("--kv-capacity") + 1] == str(runtime.IMAGE_SAFE_CONTEXT)
     assert calls[1][calls[1].index("--max-context") + 1] == str(runtime.IMAGE_SAFE_CONTEXT)
