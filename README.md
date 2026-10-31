@@ -15,19 +15,9 @@ Tuned for **RTX 3090 / 4090 (24 GB)**. Other GPUs: [ninfer-all](https://github.c
 
 No extra Python packages.
 
-## Install the CLI (Linux, RTX 30/40)
+## Install the CLI
 
-Prebuilt sm_86 binaries, no CUDA compile:
-
-```bash
-curl -fsSL https://github.com/cicalooo/ninfer-linux/releases/latest/download/install.sh | bash
-```
-
-That installs to `/opt/ninfer/ninfer`. RTX 40 series uses the same archive. Details, runtime libraries, and a user-prefix install: [cicalooo/ninfer-linux](https://github.com/cicalooo/ninfer-linux).
-
-RTX 50 and RTX PRO 6000 are not in that archive. Build or pull [ninfer-all](https://github.com/iamwavecut/ninfer-all) and set `NINFER_EXECUTABLE`.
-
-Windows: put `ninfer.exe` on `PATH`, or at `C:\ninfer\ninfer.exe`, or set `NINFER_EXECUTABLE`.
+See [docs/ninfer-install.md](docs/ninfer-install.md) — one command on Linux RTX 30/40, pointers for other GPUs and Windows.
 
 ## Install this pack
 
@@ -42,13 +32,7 @@ The folder name `Ninferencing` is what the tests import. ComfyUI itself loads th
 
 ## Model
 
-Any `.ninfer` file your CLI can load. v3 artifacts (Ternary Bonsai 2) need a ninfer-all / ninfer-linux CLI, not an older v1/v2-only build.
-
-Public cards:
-
-- [WaveCut/Ternary-Bonsai-2-27B-NInfer-v3](https://huggingface.co/WaveCut/Ternary-Bonsai-2-27B-NInfer-v3)
-- [emiltsoi/Ternary-Bonsai-2-27B-Uncensored-Heretic-NInfer](https://huggingface.co/emiltsoi/Ternary-Bonsai-2-27B-Uncensored-Heretic-NInfer)
-- Official Qwen artifacts listed in the [ninfer-all README](https://github.com/iamwavecut/ninfer-all#artifacts)
+Any `.ninfer` file your CLI can load. v3 containers need a v3-capable CLI, not an older v1/v2-only build.
 
 Put files in `ComfyUI/models/ninfer` or `~/models/ninfer`. Refresh node definitions after adding one.
 
@@ -125,7 +109,7 @@ Wire your loader's duration into `video_duration` so planning matches the plate 
 
 **Ninferencing** defaults to 32,768 tokens. When the CLI advertises the flags, it selects:
 
-- Qwen3.8-27B non-thinking sampler: temperature 0.7, top_p 0.8, top_k 20, min_p 0, presence_penalty 1.5. Thinking stays off. Switch Settings sampling to **model defaults** for the artifact's thinking sampler;
+- Default non-thinking sampler: temperature 0.7, top_p 0.8, top_k 20, min_p 0, presence_penalty 1.5. Thinking stays off. Switch Settings sampling to **model defaults** for the artifact's thinking sampler;
 - `--kv-capacity auto` for text and stills;
 - `--kv-capacity <context_length>` for native video (`auto` on Settings is treated as match-context on the video path);
 - INT8 KV cache (`fp8` / `k8v4` / `nvfp4` available when your build advertises them — smaller KV for large contexts);
